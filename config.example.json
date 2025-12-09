@@ -1,0 +1,15 @@
+{
+  "ai": {
+    "provider": "ollama",
+    "model": "llama3.2",
+    "ollama_base_url": "http://localhost:11434",
+    "openai_api_key": null,
+    "openai_base_url": "https://api.openai.com/v1",
+    "anthropic_api_key": null
+  },
+  "server": {
+    "log_level": "INFO",
+    "default_dry_run": true,
+    "auto_backup": true
+  }
+}

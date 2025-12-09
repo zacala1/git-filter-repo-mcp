@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "git-filter-repo": {
+      "command": "uv",
+      "args": ["run", "git-filter-repo-mcp"],
+      "cwd": "C:\\Users\\zacal\\source\\repos\\git-filter-repo-mcp"
+    }
+  }
+}
