@@ -211,6 +211,9 @@ def scan_content(
     commit_hash: str = "",
 ) -> list[SecretFinding]:
     """Scan content for secrets."""
+    if not isinstance(content, str):
+        return []
+
     findings = []
 
     for pattern in SECRET_PATTERNS:

@@ -1,9 +1,10 @@
-"""Tests for AI engine providers."""
+"""AI engine tests."""
 
 import pytest
 
 from git_filter_repo_mcp.ai_engine import (
     AICommitEngine,
+    AIConnectionError,
     AnthropicProvider,
     CommitContext,
     MessageStyle,
@@ -15,8 +16,6 @@ from git_filter_repo_mcp.ai_engine import (
 
 
 class TestOllamaProvider:
-    """Test Ollama provider."""
-
     def test_init_defaults(self):
         provider = OllamaProvider()
         assert provider.base_url == "http://localhost:11434"
@@ -61,8 +60,6 @@ class TestOllamaProvider:
 
 
 class TestOpenAIProvider:
-    """Test OpenAI provider."""
-
     def test_init(self):
         provider = OpenAIProvider(api_key="test-key")
         assert provider.api_key == "test-key"
@@ -79,8 +76,6 @@ class TestOpenAIProvider:
 
 
 class TestAnthropicProvider:
-    """Test Anthropic provider."""
-
     def test_init(self):
         provider = AnthropicProvider(api_key="test-key")
         assert provider.api_key == "test-key"
@@ -106,8 +101,6 @@ class TestAnthropicProvider:
 
 
 class TestGetProvider:
-    """Test get_provider factory function."""
-
     def test_get_ollama_provider(self):
         provider = get_provider("ollama")
         assert isinstance(provider, OllamaProvider)
@@ -145,8 +138,6 @@ class TestGetProvider:
 
 
 class TestAICommitEngine:
-    """Test AICommitEngine."""
-
     def test_init_default(self):
         engine = AICommitEngine()
         assert isinstance(engine.provider, OllamaProvider)
@@ -160,8 +151,6 @@ class TestAICommitEngine:
 
 
 class TestMessageStyle:
-    """Test MessageStyle enum."""
-
     def test_values(self):
         assert MessageStyle.CONVENTIONAL.value == "conventional"
         assert MessageStyle.GITMOJI.value == "gitmoji"
@@ -170,8 +159,6 @@ class TestMessageStyle:
 
 
 class TestCommitContext:
-    """Test CommitContext dataclass."""
-
     def test_minimal(self):
         ctx = CommitContext(original_message="test", commit_hash="abc123", files_changed=[])
         assert ctx.original_message == "test"
@@ -191,3 +178,57 @@ class TestCommitContext:
         assert ctx.files_changed == ["a.py", "b.py"]
         assert ctx.diff_summary == "Added 10 lines"
         assert ctx.author == "Test User"
+
+
+class TestAIConnectionError:
+    def test_basic_error(self):
+        error = AIConnectionError("Ollama", "Connection refused")
+        assert "Ollama" in str(error)
+        assert "Connection refused" in str(error)
+        assert error.provider == "Ollama"
+
+    def test_error_with_original(self):
+        original = ConnectionError("Network unreachable")
+        error = AIConnectionError("OpenAI", "API error", original)
+        assert error.original_error == original
+        assert error.provider == "OpenAI"
+
+
+class TestProviderRaiseOnError:
+    def test_ollama_raise_on_error_default(self):
+        provider = OllamaProvider()
+        assert provider.raise_on_error is True
+
+    def test_ollama_raise_on_error_disabled(self):
+        provider = OllamaProvider(raise_on_error=False)
+        assert provider.raise_on_error is False
+
+    def test_openai_raise_on_error_default(self):
+        provider = OpenAIProvider(api_key="test")
+        assert provider.raise_on_error is True
+
+    def test_openai_raise_on_error_disabled(self):
+        provider = OpenAIProvider(api_key="test", raise_on_error=False)
+        assert provider.raise_on_error is False
+
+    def test_anthropic_raise_on_error_default(self):
+        provider = AnthropicProvider(api_key="test")
+        assert provider.raise_on_error is True
+
+    def test_anthropic_raise_on_error_disabled(self):
+        provider = AnthropicProvider(api_key="test", raise_on_error=False)
+        assert provider.raise_on_error is False
+
+
+class TestProviderLastError:
+    def test_ollama_last_error_initially_none(self):
+        provider = OllamaProvider()
+        assert provider._last_error is None
+
+    def test_openai_last_error_initially_none(self):
+        provider = OpenAIProvider(api_key="test")
+        assert provider._last_error is None
+
+    def test_anthropic_last_error_initially_none(self):
+        provider = AnthropicProvider(api_key="test")
+        assert provider._last_error is None

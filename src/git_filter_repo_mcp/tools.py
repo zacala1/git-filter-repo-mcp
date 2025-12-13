@@ -124,6 +124,28 @@ class SquashCommitsInput(BaseModel):
     dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
+class ChangeCommitDatesInput(BaseModel):
+    """Input for change_commit_dates tool."""
+
+    repo_path: str = Field(description="Path to the git repository")
+    time_range: str = Field(
+        default="evening",
+        description="Time range preset: 'evening' (19:00-23:00), 'night' (22:00-02:00), "
+        "'weekend' (10:00-22:00 on weekends), 'random' (any time), or custom like '18:00-22:00'",
+    )
+    weekend_only: bool = Field(
+        default=False, description="If true, move all commits to weekends (Sat/Sun)"
+    )
+    preserve_order: bool = Field(
+        default=True, description="If true, maintain relative commit order"
+    )
+    start_date: str | None = Field(
+        default=None,
+        description="Start date for the new commit range (YYYY-MM-DD). Defaults to original earliest commit date.",
+    )
+    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
+
+
 class ReplaceTextInput(BaseModel):
     """Input for replace_text_in_history tool."""
 
@@ -297,5 +319,24 @@ Shows all commits that modified the file, including renames.""",
 
 Includes files that were deleted in later commits.""",
         "inputSchema": ListAllFilesInput.model_json_schema(),
+    },
+    {
+        "name": "change_commit_dates",
+        "description": """Change commit dates to different times (e.g., outside work hours).
+
+Use this to:
+- Move commits to evening hours (after work)
+- Move commits to weekends only
+- Randomize commit times within a range
+
+Time range presets:
+- 'evening': 19:00-23:00 on weekdays
+- 'night': 22:00-02:00
+- 'weekend': 10:00-22:00 on Sat/Sun only
+- 'random': random times throughout the day
+- Custom: specify like '18:00-22:00'
+
+IMPORTANT: Always use dry_run=true first to preview changes!""",
+        "inputSchema": ChangeCommitDatesInput.model_json_schema(),
     },
 ]

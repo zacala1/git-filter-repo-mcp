@@ -7,8 +7,8 @@ class TestToolDefinitions:
     """Test tool definitions."""
 
     def test_tool_count(self):
-        # We should have 15 tools
-        assert len(TOOL_DEFINITIONS) >= 15
+        # We should have 16 tools
+        assert len(TOOL_DEFINITIONS) >= 16
 
     def test_all_tools_have_required_fields(self):
         for tool in TOOL_DEFINITIONS:
@@ -38,6 +38,7 @@ class TestToolDefinitions:
             "replace_text_in_history",
             "get_file_history",
             "list_all_files_in_history",
+            "change_commit_dates",
         }
         for expected in expected_tools:
             assert expected in tool_names, f"Missing expected tool: {expected}"
@@ -62,6 +63,7 @@ class TestToolDefinitions:
             "squash_commits",
             "replace_text_in_history",
             "rewrite_single_commit",
+            "change_commit_dates",
         ]
         for tool in TOOL_DEFINITIONS:
             if tool["name"] in dangerous_tools:

@@ -148,10 +148,7 @@ class TestExecuteTool:
 
             assert result["success"] is True
             assert result["total_commits"] == 10
-            mock_adapter.analyze_history.assert_called_once_with(
-                branch="main",
-                max_count=50,
-            )
+            mock_adapter.analyze_history.assert_called_once_with("main", 50)
 
     @pytest.mark.asyncio
     async def test_create_backup(self):
@@ -221,11 +218,7 @@ class TestExecuteTool:
             assert result["success"] is True
             assert result["dry_run"] is True
             mock_adapter.change_author.assert_called_once_with(
-                old_email="old@example.com",
-                new_name="New Name",
-                new_email="new@example.com",
-                dry_run=True,
-                force=False,
+                "old@example.com", "New Name", "new@example.com", True, False
             )
 
     @pytest.mark.asyncio
@@ -329,10 +322,7 @@ class TestExecuteTool:
 
             assert result["success"] is True
             assert result["findings"] == []
-            mock_adapter.scan_secrets.assert_called_once_with(
-                branch="main",
-                max_commits=50,
-            )
+            mock_adapter.scan_secrets.assert_called_once_with("main", 50)
 
     @pytest.mark.asyncio
     async def test_list_all_files_in_history(self):

@@ -1,14 +1,52 @@
-"""Tests for git-filter-repo adapter."""
+"""Adapter tests."""
 
 import os
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-# Skip if git-filter-repo is not installed
-pytestmark = pytest.mark.skipif(
+
+class TestPathNormalization:
+    def test_linux_absolute_path_preserved_on_windows(self):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        with patch("platform.system", return_value="Windows"):
+            assert GitFilterRepoAdapter._normalize_path("/root/test-repo") == "/root/test-repo"
+            assert GitFilterRepoAdapter._normalize_path("/home/user/repo") == "/home/user/repo"
+            assert GitFilterRepoAdapter._normalize_path("/tmp/test") == "/tmp/test"
+
+    def test_git_bash_path_converted_on_windows(self):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        with patch("platform.system", return_value="Windows"):
+            assert GitFilterRepoAdapter._normalize_path("/c/Users/test") == "C:\\Users\\test"
+            assert GitFilterRepoAdapter._normalize_path("/d/Projects/repo") == "D:\\Projects\\repo"
+
+    def test_windows_path_with_forward_slashes(self):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        with patch("platform.system", return_value="Windows"):
+            assert GitFilterRepoAdapter._normalize_path("C:/Users/test") == "C:\\Users\\test"
+
+    def test_wsl_paths_preserved(self):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        with patch("platform.system", return_value="Windows"):
+            assert GitFilterRepoAdapter._normalize_path("//wsl$/Ubuntu/home/user") == "//wsl$/Ubuntu/home/user"
+
+    def test_paths_unchanged_on_linux(self):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        with patch("platform.system", return_value="Linux"):
+            assert GitFilterRepoAdapter._normalize_path("/c/Users/test") == "/c/Users/test"
+            assert GitFilterRepoAdapter._normalize_path("/root/test") == "/root/test"
+
+
+# Marker for tests requiring git-filter-repo
+_requires_git_filter_repo = pytest.mark.skipif(
     not any(
         (Path(p) / "git-filter-repo").exists() or (Path(p) / "git-filter-repo.exe").exists()
         for p in os.environ.get("PATH", "").split(os.pathsep)
@@ -52,9 +90,8 @@ def temp_git_repo():
         yield repo_path
 
 
+@_requires_git_filter_repo
 class TestGitFilterRepoAdapter:
-    """Test GitFilterRepoAdapter class."""
-
     def test_validate_repo(self, temp_git_repo):
         from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
@@ -145,9 +182,8 @@ class TestGitFilterRepoAdapter:
         assert history[0]["message"] == "Initial commit"
 
 
+@_requires_git_filter_repo
 class TestDryRunOperations:
-    """Test dry-run operations don't modify the repo."""
-
     def test_rewrite_messages_dry_run(self, temp_git_repo):
         from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
@@ -203,3 +239,58 @@ class TestDryRunOperations:
         # Verify commits are NOT actually squashed
         commits_after = adapter.get_commits()
         assert len(commits_after) == 3
+
+    def test_change_commit_dates_dry_run(self, temp_git_repo):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        result = adapter.change_commit_dates(
+            time_range="evening",
+            dry_run=True,
+        )
+
+        assert result.success is True
+        assert result.dry_run is True
+        assert result.commits_rewritten == 3
+        assert "Preview:" in result.message
+
+    def test_change_commit_dates_custom_range_dry_run(self, temp_git_repo):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        result = adapter.change_commit_dates(
+            time_range="20:00-23:00",
+            dry_run=True,
+        )
+
+        assert result.success is True
+        assert result.dry_run is True
+
+    def test_change_commit_dates_weekend_only_dry_run(self, temp_git_repo):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        result = adapter.change_commit_dates(
+            time_range="random",
+            weekend_only=True,
+            dry_run=True,
+        )
+
+        assert result.success is True
+        assert result.dry_run is True
+
+    def test_change_commit_dates_invalid_range(self, temp_git_repo):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        result = adapter.change_commit_dates(
+            time_range="invalid",
+            dry_run=True,
+        )
+
+        assert result.success is False
+        assert "Unknown time range" in result.message
