@@ -146,16 +146,20 @@ class GitFilterRepoAdapter:
         cmd.extend(args)
         return self._run_command(cmd, check=False, timeout=TIMEOUT_LONG)
 
+    # Record separator that won't appear in commit messages/names
+    _FIELD_SEP = "\x1e"
+
     def get_commits(self, branch: str = "HEAD", max_count: int | None = None) -> list[CommitInfo]:
         """Get commit information from the repository."""
-        args = ["log", "--format=%H|%an|%ae|%cn|%ce|%s|%aI", branch]
+        sep = self._FIELD_SEP
+        args = ["log", f"--format=%H{sep}%an{sep}%ae{sep}%cn{sep}%ce{sep}%s{sep}%aI", branch]
         if max_count:
             args.append(f"-n{max_count}")
 
         result = self._run_git(*args)
         commits = []
         for line in _parse_lines(result.stdout):
-            parts = line.split("|", 6)
+            parts = line.split(sep, 6)
             if len(parts) >= 7:
                 commits.append(CommitInfo(*parts[:7]))
         return commits
@@ -575,9 +579,10 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
 
     def get_file_history(self, file_path: str) -> list[dict]:
         """Get commit history for a specific file."""
+        sep = self._FIELD_SEP
         history = []
-        for line in _parse_lines(self._run_git("log", "--follow", "--format=%H|%an|%ae|%s|%aI", "--", file_path).stdout):
-            parts = line.split("|", 4)
+        for line in _parse_lines(self._run_git("log", "--follow", f"--format=%H{sep}%an{sep}%ae{sep}%s{sep}%aI", "--", file_path).stdout):
+            parts = line.split(sep, 4)
             if len(parts) >= 5:
                 history.append({"hash": parts[0][:8], "author": f"{parts[1]} <{parts[2]}>", "message": parts[3], "date": parts[4]})
         return history
