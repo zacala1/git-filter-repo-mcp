@@ -618,16 +618,17 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
             expressions_path = f.name
 
         if dry_run:
-            # Use -- to prevent old_text starting with - from being parsed as grep flags
-            grep_args = ["grep", "-r", "-l", "-F", "--", old_text, "."]
-            if file_pattern:
-                grep_args.extend(["--include", file_pattern])
+            # Search git history (not working directory) for affected files
             try:
-                files_with_matches = _parse_lines(self._run_command(grep_args, check=False).stdout)
+                git_args = ["log", "--all", "-S", old_text, "--name-only", "--format="]
+                if file_pattern:
+                    git_args.extend(["--", file_pattern])
+                result = self._run_git(*git_args)
+                files_with_matches = sorted(set(_parse_lines(result.stdout)))
             except Exception:
                 files_with_matches = []
             Path(expressions_path).unlink(missing_ok=True)
-            return FilterResult(success=True, message=f"Dry run: {len(files_with_matches)} files", files_affected=files_with_matches[:20], dry_run=True)
+            return FilterResult(success=True, message=f"Dry run: {len(files_with_matches)} files in history", files_affected=files_with_matches[:20], dry_run=True)
 
         try:
             args = ["--replace-text", expressions_path]
