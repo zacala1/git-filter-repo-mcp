@@ -105,15 +105,19 @@ async def _check_ai_connection(provider, provider_name: str) -> dict | None:
 @tool_handler("analyze_git_history")
 async def _handle_analyze(args: dict) -> dict:
     params = AnalyzeHistoryInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    return {"success": True, **adapter.analyze_history(params.branch, params.max_count)}
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        return {"success": True, **adapter.analyze_history(params.branch, params.max_count)}
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("rewrite_commit_messages")
 async def _handle_rewrite_messages(args: dict) -> dict:
     params = RewriteCommitMessagesInput(**args)
     dry_run = params.dry_run
-    adapter = GitFilterRepoAdapter(params.repo_path)
+    adapter = await asyncio.to_thread(GitFilterRepoAdapter, params.repo_path)
 
     if params.use_ai:
         ai_provider_name = params.ai_provider or config.ai.provider
@@ -124,11 +128,11 @@ async def _handle_rewrite_messages(args: dict) -> dict:
             if err := await _check_ai_connection(provider, ai_provider_name):
                 return err
 
-            commits = adapter.get_commits(params.branch)
+            commits = await asyncio.to_thread(adapter.get_commits, params.branch)
             rewrites = []
 
             for commit in commits:
-                files = adapter.get_commit_files(commit.hash)
+                files = await asyncio.to_thread(adapter.get_commit_files, commit.hash)
                 result = await engine.rewrite_message(commit.message, commit.hash, files)
                 if result.rewritten != commit.message:
                     rewrites.append({
@@ -156,7 +160,8 @@ async def _handle_rewrite_messages(args: dict) -> dict:
             def sync_callback(msg: str, commit_hash: str) -> str:
                 return rewrite_by_hash.get(commit_hash, msg)
 
-            result = adapter.rewrite_commit_messages(
+            result = await asyncio.to_thread(
+                adapter.rewrite_commit_messages,
                 sync_callback, branch=params.branch, dry_run=False, force=True,
             )
             return result_to_dict(result)
@@ -169,7 +174,8 @@ async def _handle_rewrite_messages(args: dict) -> dict:
         def callback(msg: str, _: str) -> str:
             return params.manual_mappings.get(msg, msg)
 
-        result = adapter.rewrite_commit_messages(
+        result = await asyncio.to_thread(
+            adapter.rewrite_commit_messages,
             callback, branch=params.branch, dry_run=dry_run, force=not dry_run,
         )
         return result_to_dict(result)
@@ -181,78 +187,106 @@ async def _handle_rewrite_messages(args: dict) -> dict:
 @tool_handler("change_author")
 async def _handle_change_author(args: dict) -> dict:
     params = ChangeAuthorInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    return result_to_dict(
-        adapter.change_author(params.old_email, params.new_name, params.new_email, params.dry_run, not params.dry_run)
-    )
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        return result_to_dict(
+            adapter.change_author(params.old_email, params.new_name, params.new_email, params.dry_run, not params.dry_run)
+        )
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("remove_files_from_history")
 async def _handle_remove_files(args: dict) -> dict:
     params = RemoveFilesInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    return result_to_dict(adapter.remove_files(params.paths, params.dry_run, not params.dry_run))
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        return result_to_dict(adapter.remove_files(params.paths, params.dry_run, not params.dry_run))
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("remove_large_files")
 async def _handle_remove_large_files(args: dict) -> dict:
     params = RemoveLargeFilesInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    return result_to_dict(adapter.remove_large_files(params.size_threshold_mb, params.dry_run, not params.dry_run))
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        return result_to_dict(adapter.remove_large_files(params.size_threshold_mb, params.dry_run, not params.dry_run))
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("filter_paths")
 async def _handle_filter_paths(args: dict) -> dict:
     params = FilterPathsInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    return result_to_dict(
-        adapter.filter_paths(params.include_paths, params.exclude_paths, params.dry_run, not params.dry_run)
-    )
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        return result_to_dict(
+            adapter.filter_paths(params.include_paths, params.exclude_paths, params.dry_run, not params.dry_run)
+        )
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("create_backup")
 async def _handle_create_backup(args: dict) -> dict:
     params = CreateBackupInput(**args)
-    backup = GitFilterRepoAdapter(params.repo_path).create_backup()
-    return {"success": True, "backup_branch": backup, "message": f"Backup: {backup}"}
+
+    def _run():
+        backup = GitFilterRepoAdapter(params.repo_path).create_backup()
+        return {"success": True, "backup_branch": backup, "message": f"Backup: {backup}"}
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("restore_backup")
 async def _handle_restore_backup(args: dict) -> dict:
     params = RestoreBackupInput(**args)
-    return result_to_dict(GitFilterRepoAdapter(params.repo_path).restore_backup(params.backup_branch))
+
+    def _run():
+        return result_to_dict(GitFilterRepoAdapter(params.repo_path).restore_backup(params.backup_branch))
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("get_commit_details")
 async def _handle_get_commit_details(args: dict) -> dict:
     params = GetCommitDetailsInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    commits = adapter.get_commits(params.commit_hash, max_count=1)
-    if not commits:
-        return {"success": False, "error": f"Commit not found: {params.commit_hash}"}
-    c = commits[0]
-    return {
-        "success": True,
-        "commit": {
-            "hash": c.hash,
-            "author_name": c.author_name,
-            "author_email": c.author_email,
-            "committer_name": c.committer_name,
-            "committer_email": c.committer_email,
-            "message": c.message,
-            "date": c.date,
-            "files": adapter.get_commit_files(c.hash),
-        },
-        "diff_summary": (adapter.get_commit_diff(c.hash) or "")[:2000] or None,
-    }
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        commits = adapter.get_commits(params.commit_hash, max_count=1)
+        if not commits:
+            return {"success": False, "error": f"Commit not found: {params.commit_hash}"}
+        c = commits[0]
+        return {
+            "success": True,
+            "commit": {
+                "hash": c.hash,
+                "author_name": c.author_name,
+                "author_email": c.author_email,
+                "committer_name": c.committer_name,
+                "committer_email": c.committer_email,
+                "message": c.message,
+                "date": c.date,
+                "files": adapter.get_commit_files(c.hash),
+            },
+            "diff_summary": (adapter.get_commit_diff(c.hash) or "")[:2000] or None,
+        }
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("rewrite_single_commit")
 async def _handle_rewrite_single_commit(args: dict) -> dict:
     params = RewriteSingleCommitInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
+    adapter = await asyncio.to_thread(GitFilterRepoAdapter, params.repo_path)
     commit_hash = params.commit_hash
-    commits = adapter.get_commits(commit_hash, max_count=1)
+    commits = await asyncio.to_thread(adapter.get_commits, commit_hash, 1)
     if not commits:
         return {"success": False, "error": f"Commit not found: {commit_hash}"}
 
@@ -266,7 +300,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         try:
             if err := await _check_ai_connection(provider, ai_provider_name):
                 return err
-            files = adapter.get_commit_files(commit.hash)
+            files = await asyncio.to_thread(adapter.get_commit_files, commit.hash)
             result = await engine.rewrite_message(commit.message, commit.hash, files)
             new_message = result.rewritten
         except AIConnectionError as e:
@@ -293,12 +327,15 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
                 return new_message
             return msg
 
-        result = adapter.rewrite_commit_messages(msg_callback, dry_run=False, force=True)
+        result = await asyncio.to_thread(
+            adapter.rewrite_commit_messages, msg_callback, dry_run=False, force=True,
+        )
         if result.success:
             changes_made.append("message")
 
     if params.new_author_email and params.new_author_name:
-        result = adapter.change_author(
+        result = await asyncio.to_thread(
+            adapter.change_author,
             old_email=commit.author_email,
             new_name=params.new_author_name,
             new_email=params.new_author_email,
@@ -318,62 +355,86 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
 @tool_handler("scan_secrets")
 async def _handle_scan_secrets(args: dict) -> dict:
     params = ScanSecretsInput(**args)
-    return {"success": True, **GitFilterRepoAdapter(params.repo_path).scan_secrets(params.branch, params.max_commits)}
+
+    def _run():
+        return {"success": True, **GitFilterRepoAdapter(params.repo_path).scan_secrets(params.branch, params.max_commits)}
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("squash_commits")
 async def _handle_squash_commits(args: dict) -> dict:
     params = SquashCommitsInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
-    result = adapter.squash_commits(params.start_commit, params.end_commit, params.new_message, params.dry_run)
-    response = result_to_dict(result)
-    if backup:
-        response["backup_branch"] = backup
-    return response
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+        result = adapter.squash_commits(params.start_commit, params.end_commit, params.new_message, params.dry_run)
+        response = result_to_dict(result)
+        if backup:
+            response["backup_branch"] = backup
+        return response
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("replace_text_in_history")
 async def _handle_replace_text(args: dict) -> dict:
     params = ReplaceTextInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
-    result = adapter.replace_text_in_history(
-        params.old_text, params.new_text, params.file_pattern, params.dry_run, not params.dry_run,
-    )
-    response = result_to_dict(result)
-    if backup:
-        response["backup_branch"] = backup
-    return response
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+        result = adapter.replace_text_in_history(
+            params.old_text, params.new_text, params.file_pattern, params.dry_run, not params.dry_run,
+        )
+        response = result_to_dict(result)
+        if backup:
+            response["backup_branch"] = backup
+        return response
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("get_file_history")
 async def _handle_get_file_history(args: dict) -> dict:
     params = GetFileHistoryInput(**args)
-    history = GitFilterRepoAdapter(params.repo_path).get_file_history(params.file_path)
-    return {"success": True, "file_path": params.file_path, "commits": history, "total_commits": len(history)}
+
+    def _run():
+        history = GitFilterRepoAdapter(params.repo_path).get_file_history(params.file_path)
+        return {"success": True, "file_path": params.file_path, "commits": history, "total_commits": len(history)}
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("list_all_files_in_history")
 async def _handle_list_all_files(args: dict) -> dict:
     params = ListAllFilesInput(**args)
-    files = GitFilterRepoAdapter(params.repo_path).list_all_files_in_history()
-    return {"success": True, "files": files[:500], "total_files": len(files), "truncated": len(files) > 500}
+
+    def _run():
+        files = GitFilterRepoAdapter(params.repo_path).list_all_files_in_history()
+        return {"success": True, "files": files[:500], "total_files": len(files), "truncated": len(files) > 500}
+
+    return await asyncio.to_thread(_run)
 
 
 @tool_handler("change_commit_dates")
 async def _handle_change_dates(args: dict) -> dict:
     params = ChangeCommitDatesInput(**args)
-    adapter = GitFilterRepoAdapter(params.repo_path)
-    backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
-    result = adapter.change_commit_dates(
-        params.time_range, params.weekend_only, params.preserve_order,
-        params.start_date, dry_run=params.dry_run, force=not params.dry_run,
-    )
-    response = result_to_dict(result)
-    if backup:
-        response["backup_branch"] = backup
-    return response
+
+    def _run():
+        adapter = GitFilterRepoAdapter(params.repo_path)
+        backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+        result = adapter.change_commit_dates(
+            params.time_range, params.weekend_only, params.preserve_order,
+            params.start_date, dry_run=params.dry_run, force=not params.dry_run,
+        )
+        response = result_to_dict(result)
+        if backup:
+            response["backup_branch"] = backup
+        return response
+
+    return await asyncio.to_thread(_run)
 
 
 # --- MCP Protocol ---
