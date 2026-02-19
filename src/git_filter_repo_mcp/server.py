@@ -136,7 +136,8 @@ async def _execute_tool(name: str, args: dict[str, Any]) -> dict:
                     if new_message != commit.message:
                         rewrites.append(
                             {
-                                "hash": commit.hash[:8],
+                                "hash": commit.hash,
+                                "hash_short": commit.hash[:8],
                                 "original": commit.message,
                                 "new": new_message,
                             }
@@ -147,16 +148,18 @@ async def _execute_tool(name: str, args: dict[str, Any]) -> dict:
                         "success": True,
                         "dry_run": True,
                         "message": f"Would rewrite {len(rewrites)} commits",
-                        "commits_to_rewrite": rewrites[:20],
+                        "commits_to_rewrite": [
+                            {"hash": r["hash_short"], "original": r["original"], "new": r["new"]}
+                            for r in rewrites[:20]
+                        ],
                         "total_rewrites": len(rewrites),
                         "ai_provider": ai_provider_name,
                     }
 
-                def sync_callback(msg: str, hash: str) -> str:
-                    for r in rewrites:
-                        if msg == r["original"]:
-                            return r["new"]
-                    return msg
+                rewrite_by_hash = {r["hash"]: r["new"] for r in rewrites}
+
+                def sync_callback(msg: str, commit_hash: str) -> str:
+                    return rewrite_by_hash.get(commit_hash, msg)
 
                 result = adapter.rewrite_commit_messages(
                     sync_callback,
