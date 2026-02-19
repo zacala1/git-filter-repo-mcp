@@ -234,14 +234,14 @@ class GitFilterRepoAdapter:
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             # Write self-contained script with embedded data
+            # git-filter-repo exec's this with `message` (bytes) in scope;
+            # we must reassign `message` for changes to take effect.
             f.write(f'''import base64, json
 _DATA = "{encoded_replacements}"
-REPLACEMENTS = json.loads(base64.b64decode(_DATA).decode())
-
-def message_callback(message):
-    msg_str = message.decode('utf-8') if isinstance(message, bytes) else message
-    new_msg = REPLACEMENTS.get(msg_str.strip(), msg_str)
-    return new_msg.encode('utf-8') if isinstance(message, bytes) else new_msg
+_REPLACEMENTS = json.loads(base64.b64decode(_DATA).decode())
+_msg_str = message.decode('utf-8') if isinstance(message, bytes) else message
+_new_msg = _REPLACEMENTS.get(_msg_str.strip(), _msg_str)
+message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
 ''')
             script_path = f.name
 
@@ -781,17 +781,17 @@ def message_callback(message):
         encoded_mappings = base64.b64encode(json.dumps(date_mappings).encode()).decode()
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            # git-filter-repo exec's this with `commit` object in scope;
+            # we modify commit properties directly (no reassignment needed).
             f.write(f'''import base64, json
 _DATA = "{encoded_mappings}"
-DATE_MAP = json.loads(base64.b64decode(_DATA).decode())
-
-def commit_callback(commit):
-    commit_hash = commit.original_id.decode() if commit.original_id else None
-    if commit_hash and commit_hash in DATE_MAP:
-        new_ts = DATE_MAP[commit_hash]
-        new_date = f"{{new_ts}} +0000".encode()
-        commit.author_date = new_date
-        commit.committer_date = new_date
+_DATE_MAP = json.loads(base64.b64decode(_DATA).decode())
+_commit_hash = commit.original_id.decode() if commit.original_id else None
+if _commit_hash and _commit_hash in _DATE_MAP:
+    _new_ts = _DATE_MAP[_commit_hash]
+    _new_date = f"{{_new_ts}} +0000".encode()
+    commit.author_date = _new_date
+    commit.committer_date = _new_date
 ''')
             script_path = f.name
 
