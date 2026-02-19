@@ -22,7 +22,7 @@ class RewriteCommitMessagesInput(BaseModel):
     )
     dry_run: bool = Field(default=True, description="If true, only show what would be changed")
     use_ai: bool = Field(default=True, description="Use AI to generate new messages")
-    ai_provider: str = Field(default="ollama", description="AI provider: ollama or openai")
+    ai_provider: str = Field(default="ollama", description="AI provider: ollama, openai, or anthropic")
     ai_model: str = Field(default="llama3.2", description="AI model to use")
     manual_mappings: dict[str, str] | None = Field(
         default=None, description="Manual message mappings: {old_message: new_message}"
@@ -99,7 +99,7 @@ class RewriteSingleCommitInput(BaseModel):
     new_author_name: str | None = Field(default=None, description="New author name")
     new_author_email: str | None = Field(default=None, description="New author email")
     use_ai: bool = Field(default=False, description="Use AI to generate message if not provided")
-    ai_provider: str = Field(default="ollama", description="AI provider: ollama or openai")
+    ai_provider: str = Field(default="ollama", description="AI provider: ollama, openai, or anthropic")
     ai_model: str = Field(default="llama3.2", description="AI model to use")
     dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
