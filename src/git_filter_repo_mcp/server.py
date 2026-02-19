@@ -84,12 +84,14 @@ def result_to_dict(result: FilterResult) -> dict:
 
 def _create_ai_provider(args: dict, provider_name: str):
     """Create an AI provider from args and config."""
+    api_keys = {
+        "openai": config.ai.openai_api_key,
+        "anthropic": config.ai.anthropic_api_key,
+    }
     return get_provider(
         provider_name,
         model=args.get("ai_model", config.ai.model),
-        api_key=config.ai.openai_api_key
-        if provider_name == "openai"
-        else config.ai.anthropic_api_key,
+        api_key=api_keys.get(provider_name),
         base_url=config.ai.ollama_base_url,
     )
 
