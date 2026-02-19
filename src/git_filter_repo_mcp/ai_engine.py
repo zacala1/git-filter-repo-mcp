@@ -1,6 +1,7 @@
 """AI-powered commit message engine using Ollama, OpenAI, or Anthropic."""
 
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
@@ -123,8 +124,70 @@ Original commit message: "{context.original_message}"
 Respond with ONLY the new commit message, nothing else. Do not include quotes around the message."""
 
 
-class OllamaProvider:
+class BaseProvider(ABC):
+    """Base class for AI providers with shared error handling."""
+
+    provider_name: str = "base"
+
+    def __init__(self, model: str, raise_on_error: bool = True):
+        self.model = model
+        self.raise_on_error = raise_on_error
+        self._last_error: str | None = None
+
+    @abstractmethod
+    def _create_client(self) -> httpx.AsyncClient: ...
+
+    @abstractmethod
+    async def check_connection(self) -> tuple[bool, str]: ...
+
+    @abstractmethod
+    async def _call_api(self, prompt: str) -> str:
+        """Call the provider API and return the raw message text."""
+        ...
+
+    async def generate_message(self, context: CommitContext, style: MessageStyle) -> str:
+        """Generate message with shared error handling."""
+        prompt = build_prompt(context, style)
+        self._last_error = None
+
+        try:
+            raw = await self._call_api(prompt)
+            return self._parse_response(raw, style)
+        except httpx.ConnectError as e:
+            self._last_error = f"Cannot connect to {self.provider_name}"
+            logger.warning(f"{self.provider_name.lower()} connect: {e}")
+            if self.raise_on_error:
+                raise AIConnectionError(self.provider_name, self._last_error, e)
+            return context.original_message
+        except httpx.HTTPError as e:
+            self._last_error = str(e)
+            logger.warning(f"{self.provider_name.lower()}: {e}")
+            if self.raise_on_error:
+                raise AIConnectionError(self.provider_name, self._last_error, e)
+            return context.original_message
+
+    def _parse_response(self, response: str, style: MessageStyle) -> str:
+        """Parse and normalize response text."""
+        message = response.strip().strip("\"'")
+
+        if style == MessageStyle.CONVENTIONAL:
+            valid_prefixes = [
+                "feat:", "fix:", "docs:", "style:", "refactor:",
+                "test:", "chore:", "perf:", "ci:", "build:", "revert:",
+            ]
+            if not any(message.lower().startswith(p) for p in valid_prefixes):
+                message = f"chore: {message}"
+
+        return message
+
+    async def close(self):
+        await self.client.aclose()
+
+
+class OllamaProvider(BaseProvider):
     """Ollama provider."""
+
+    provider_name = "Ollama"
 
     def __init__(
         self,
@@ -132,14 +195,14 @@ class OllamaProvider:
         model: str = "llama3.2",
         raise_on_error: bool = True,
     ):
+        super().__init__(model, raise_on_error)
         self.base_url = base_url
-        self.model = model
-        self.raise_on_error = raise_on_error
-        self.client = httpx.AsyncClient(timeout=60.0)
-        self._last_error: str | None = None
+        self.client = self._create_client()
+
+    def _create_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=60.0)
 
     async def check_connection(self) -> tuple[bool, str]:
-        """Check connection."""
         try:
             response = await self.client.get(f"{self.base_url}/api/tags", timeout=5.0)
             response.raise_for_status()
@@ -153,90 +216,39 @@ class OllamaProvider:
         except httpx.HTTPError as e:
             return False, f"Ollama: {e}"
 
-    async def generate_message(self, context: CommitContext, style: MessageStyle) -> str:
-        """Generate message."""
-        prompt = build_prompt(context, style)
-        self._last_error = None
-
-        try:
-            response = await self.client.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "top_p": 0.9,
-                    },
-                },
-            )
-            response.raise_for_status()
-            result = response.json()
-            return self._parse_response(result.get("response", ""), style)
-        except httpx.ConnectError as e:
-            self._last_error = f"Cannot connect to Ollama at {self.base_url}"
-            logger.warning(f"ollama connect: {e}")
-            if self.raise_on_error:
-                raise AIConnectionError("Ollama", self._last_error, e)
-            return context.original_message
-        except httpx.HTTPError as e:
-            self._last_error = str(e)
-            logger.warning(f"ollama: {e}")
-            if self.raise_on_error:
-                raise AIConnectionError("Ollama", self._last_error, e)
-            return context.original_message
-
-    def _parse_response(self, response: str, style: MessageStyle) -> str:
-        """Parse response."""
-        message = response.strip().strip("\"'")
-
-        # Ensure proper format for conventional commits
-        if style == MessageStyle.CONVENTIONAL:
-            valid_prefixes = [
-                "feat:",
-                "fix:",
-                "docs:",
-                "style:",
-                "refactor:",
-                "test:",
-                "chore:",
-                "perf:",
-                "ci:",
-                "build:",
-                "revert:",
-            ]
-            has_prefix = any(message.lower().startswith(p) for p in valid_prefixes)
-            if not has_prefix:
-                # Try to infer the type
-                message = f"chore: {message}"
-
-        return message
-
-    async def close(self):
-        await self.client.aclose()
+    async def _call_api(self, prompt: str) -> str:
+        response = await self.client.post(
+            f"{self.base_url}/api/generate",
+            json={
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.3, "top_p": 0.9},
+            },
+        )
+        response.raise_for_status()
+        return response.json().get("response", "")
 
 
-class OpenAIProvider:
+class OpenAIProvider(BaseProvider):
     """OpenAI provider."""
 
+    provider_name = "OpenAI"
+
     def __init__(self, api_key: str, model: str = "gpt-4o-mini", raise_on_error: bool = True):
+        super().__init__(model, raise_on_error)
         self.api_key = api_key
-        self.model = model
-        self.raise_on_error = raise_on_error
-        self.client = httpx.AsyncClient(
+        self.client = self._create_client()
+
+    def _create_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             timeout=30.0,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"Authorization": f"Bearer {self.api_key}"},
         )
-        self._last_error: str | None = None
 
     async def check_connection(self) -> tuple[bool, str]:
-        """Check connection."""
         try:
-            response = await self.client.get(
-                "https://api.openai.com/v1/models",
-                timeout=5.0,
-            )
+            response = await self.client.get("https://api.openai.com/v1/models", timeout=5.0)
             if response.status_code == 401:
                 return False, "Invalid API key"
             response.raise_for_status()
@@ -246,73 +258,51 @@ class OpenAIProvider:
         except httpx.HTTPError as e:
             return False, f"OpenAI: {e}"
 
-    async def generate_message(self, context: CommitContext, style: MessageStyle) -> str:
-        """Generate message."""
-        prompt = build_prompt(context, style)
-        self._last_error = None
-
+    async def _call_api(self, prompt: str) -> str:
+        response = await self.client.post(
+            "https://api.openai.com/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "You are a git commit message writer. Respond only with the commit message."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 200,
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
         try:
-            response = await self.client.post(
-                "https://api.openai.com/v1/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a git commit message writer. Respond only with the commit message.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 200,
-                },
-            )
-            response.raise_for_status()
-            result = response.json()
-            try:
-                message = result["choices"][0]["message"]["content"]
-            except (KeyError, IndexError, TypeError):
-                logger.warning(f"openai unexpected response: {result}")
-                if self.raise_on_error:
-                    raise AIConnectionError("OpenAI", "Unexpected response format")
-                return context.original_message
-            return message.strip().strip("\"'") if message else context.original_message
-        except httpx.ConnectError as e:
-            self._last_error = "Cannot connect to OpenAI"
-            logger.warning(f"openai connect: {e}")
+            return result["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            logger.warning(f"openai unexpected response: {result}")
             if self.raise_on_error:
-                raise AIConnectionError("OpenAI", self._last_error, e)
-            return context.original_message
-        except httpx.HTTPError as e:
-            self._last_error = str(e)
-            logger.warning(f"openai: {e}")
-            if self.raise_on_error:
-                raise AIConnectionError("OpenAI", self._last_error, e)
-            return context.original_message
-
-    async def close(self):
-        await self.client.aclose()
+                raise AIConnectionError("OpenAI", "Unexpected response format")
+            return ""
 
 
-class AnthropicProvider:
+class AnthropicProvider(BaseProvider):
     """Anthropic provider."""
 
+    provider_name = "Anthropic"
+
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514", raise_on_error: bool = True):
+        super().__init__(model, raise_on_error)
         self.api_key = api_key
-        self.model = model
-        self.raise_on_error = raise_on_error
-        self.client = httpx.AsyncClient(
+        self.client = self._create_client()
+
+    def _create_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             timeout=30.0,
             headers={
-                "x-api-key": api_key,
+                "x-api-key": self.api_key,
                 "anthropic-version": "2024-01-01",
                 "content-type": "application/json",
             },
         )
-        self._last_error: str | None = None
 
     async def check_connection(self) -> tuple[bool, str]:
-        """Check connection."""
         try:
             response = await self.client.post(
                 "https://api.anthropic.com/v1/messages",
@@ -334,46 +324,25 @@ class AnthropicProvider:
         except httpx.HTTPError as e:
             return False, f"Anthropic: {e}"
 
-    async def generate_message(self, context: CommitContext, style: MessageStyle) -> str:
-        """Generate message."""
-        prompt = build_prompt(context, style)
-        self._last_error = None
-
+    async def _call_api(self, prompt: str) -> str:
+        response = await self.client.post(
+            "https://api.anthropic.com/v1/messages",
+            json={
+                "model": self.model,
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}],
+                "system": "You are a git commit message writer. Respond only with the commit message, nothing else.",
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
         try:
-            response = await self.client.post(
-                "https://api.anthropic.com/v1/messages",
-                json={
-                    "model": self.model,
-                    "max_tokens": 200,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "system": "You are a git commit message writer. Respond only with the commit message, nothing else.",
-                },
-            )
-            response.raise_for_status()
-            result = response.json()
-            try:
-                message = result["content"][0]["text"]
-            except (KeyError, IndexError, TypeError):
-                logger.warning(f"anthropic unexpected response: {result}")
-                if self.raise_on_error:
-                    raise AIConnectionError("Anthropic", "Unexpected response format")
-                return context.original_message
-            return message.strip().strip("\"'") if message else context.original_message
-        except httpx.ConnectError as e:
-            self._last_error = "Cannot connect to Anthropic"
-            logger.warning(f"anthropic connect: {e}")
+            return result["content"][0]["text"] or ""
+        except (KeyError, IndexError, TypeError):
+            logger.warning(f"anthropic unexpected response: {result}")
             if self.raise_on_error:
-                raise AIConnectionError("Anthropic", self._last_error, e)
-            return context.original_message
-        except httpx.HTTPError as e:
-            self._last_error = str(e)
-            logger.warning(f"anthropic: {e}")
-            if self.raise_on_error:
-                raise AIConnectionError("Anthropic", self._last_error, e)
-            return context.original_message
-
-    async def close(self):
-        await self.client.aclose()
+                raise AIConnectionError("Anthropic", "Unexpected response format")
+            return ""
 
 
 class AICommitEngine:
