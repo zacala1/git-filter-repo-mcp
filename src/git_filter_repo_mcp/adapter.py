@@ -338,7 +338,7 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
                 commits_rewritten=len(affected), files_affected=paths, dry_run=True,
             )
 
-        args = [arg for path in paths for arg in ("--path", path, "--invert-paths")]
+        args = ["--invert-paths"] + [arg for path in paths for arg in ("--path", path)]
         result = self._run_filter_repo(*args, dry_run=False, force=force)
 
         if result.returncode != 0:
@@ -412,7 +412,20 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
         dry_run: bool = True,
         force: bool = False,
     ) -> FilterResult:
-        """Filter repository to include/exclude specific paths."""
+        """Filter repository to include/exclude specific paths.
+
+        Note: include_paths and exclude_paths cannot be used together because
+        git-filter-repo's --invert-paths is a global flag that inverts ALL
+        path selections. Use one or the other per invocation.
+        """
+        if include_paths and exclude_paths:
+            return FilterResult(
+                success=False,
+                message="Cannot use include_paths and exclude_paths together",
+                error="git-filter-repo's --invert-paths is global and would invert all path "
+                "selections. Use include_paths OR exclude_paths per invocation.",
+            )
+
         args = []
 
         if include_paths:
@@ -420,8 +433,9 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
                 args.extend(["--path", path])
 
         if exclude_paths:
+            args.append("--invert-paths")
             for path in exclude_paths:
-                args.extend(["--path", path, "--invert-paths"])
+                args.extend(["--path", path])
 
         if dry_run:
             return FilterResult(
