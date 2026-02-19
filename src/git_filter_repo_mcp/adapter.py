@@ -611,12 +611,15 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
         self, old_text: str, new_text: str, file_pattern: str | None = None, dry_run: bool = True, force: bool = False,
     ) -> FilterResult:
         """Replace text throughout repository history."""
+        # Escape ==> in new_text to prevent git-filter-repo expression parsing issues
+        safe_new_text = new_text.replace("==>", "\\=\\=\\>")
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write(f"regex:{re.escape(old_text)}==>{new_text}\n")
+            f.write(f"regex:{re.escape(old_text)}==>{safe_new_text}\n")
             expressions_path = f.name
 
         if dry_run:
-            grep_args = ["grep", "-r", "-l", old_text, "."]
+            # Use -- to prevent old_text starting with - from being parsed as grep flags
+            grep_args = ["grep", "-r", "-l", "-F", "--", old_text, "."]
             if file_pattern:
                 grep_args.extend(["--include", file_pattern])
             try:
