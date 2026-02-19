@@ -128,3 +128,39 @@ class TestRedaction:
         result1 = redact_secret("secret_one_12345")
         result2 = redact_secret("secret_two_12345")
         assert result1 != result2
+
+
+class TestOpenAIAnthropicPatternSeparation:
+    """Test that OpenAI pattern doesn't match Anthropic keys."""
+
+    def test_anthropic_key_not_matched_as_openai(self):
+        # Anthropic key starts with sk-ant-
+        content = "API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        findings = scan_content(content, "config.py", "abc123")
+        openai_findings = [f for f in findings if f.pattern_name == "openai_api_key"]
+        assert len(openai_findings) == 0
+
+    def test_anthropic_key_matched_as_anthropic(self):
+        content = "API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        findings = scan_content(content, "config.py", "abc123")
+        anthropic_findings = [f for f in findings if f.pattern_name == "anthropic_api_key"]
+        assert len(anthropic_findings) >= 1
+
+    def test_openai_key_still_detected(self):
+        content = "OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        findings = scan_content(content, ".env", "abc123")
+        openai_findings = [f for f in findings if f.pattern_name == "openai_api_key"]
+        assert len(openai_findings) >= 1
+
+
+class TestScanContentDedup:
+    """Test that scan_content deduplicates overlapping findings."""
+
+    def test_overlapping_patterns_deduplicated(self):
+        # A generic_secret pattern and a specific pattern could overlap
+        # Use a string that matches multiple patterns at the same position
+        content = 'api_key = "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"'
+        findings = scan_content(content, "config.py", "abc123")
+        # Each character span should only be reported once
+        spans = [(f.line_number, f.matched_text) for f in findings]
+        assert len(spans) == len(set(spans))

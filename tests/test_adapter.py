@@ -294,3 +294,32 @@ class TestDryRunOperations:
 
         assert result.success is False
         assert "Unknown time range" in result.message
+
+    def test_filter_paths_include_exclude_rejected(self, temp_git_repo):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        result = adapter.filter_paths(
+            include_paths=["src/"],
+            exclude_paths=["tests/"],
+            dry_run=True,
+        )
+
+        assert result.success is False
+        assert "Cannot use include_paths and exclude_paths together" in result.message
+
+    def test_replace_text_dry_run_searches_history(self, temp_git_repo):
+        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        result = adapter.replace_text_in_history(
+            old_text="hello",
+            new_text="world",
+            dry_run=True,
+        )
+
+        assert result.success is True
+        assert result.dry_run is True
+        assert "history" in result.message

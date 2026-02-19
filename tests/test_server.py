@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from git_filter_repo_mcp.adapter import FilterResult
+from git_filter_repo_mcp.adapter import CommitInfo, FilterResult
 from git_filter_repo_mcp.server import (
     _execute_tool,
     call_tool,
@@ -418,3 +418,208 @@ class TestRewriteCommitMessages:
 
             assert "error" in result
             assert "manual_mappings" in result["error"]
+
+
+class TestValidationErrorHandling:
+    """Test that Pydantic validation errors return useful messages."""
+
+    @pytest.mark.asyncio
+    async def test_missing_required_field(self):
+        result = await _execute_tool("analyze_git_history", {})
+        assert result["success"] is False
+        assert "Invalid input" in result["error"]
+        assert "repo_path" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_wrong_type(self):
+        result = await _execute_tool(
+            "analyze_git_history",
+            {"repo_path": "/tmp/repo", "max_count": "not_a_number"},
+        )
+        assert result["success"] is False
+        assert "Invalid input" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_required_field_change_author(self):
+        result = await _execute_tool(
+            "change_author",
+            {"repo_path": "/tmp/repo"},
+        )
+        assert result["success"] is False
+        assert "Invalid input" in result["error"]
+
+
+class TestRewriteSingleCommit:
+    """Test rewrite_single_commit tool."""
+
+    @pytest.mark.asyncio
+    async def test_no_changes_returns_error(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo(
+                    hash="abc123def456",
+                    author_name="Test",
+                    author_email="test@example.com",
+                    committer_name="Test",
+                    committer_email="test@example.com",
+                    message="Original message",
+                    date="2024-12-09",
+                )
+            ]
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_single_commit",
+                {
+                    "repo_path": "/tmp/repo",
+                    "commit_hash": "abc123",
+                    "dry_run": False,
+                },
+            )
+
+            assert result["success"] is False
+            assert "No changes specified" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_dry_run_shows_changes(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo(
+                    hash="abc123def456",
+                    author_name="Test",
+                    author_email="test@example.com",
+                    committer_name="Test",
+                    committer_email="test@example.com",
+                    message="Original message",
+                    date="2024-12-09",
+                )
+            ]
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_single_commit",
+                {
+                    "repo_path": "/tmp/repo",
+                    "commit_hash": "abc123",
+                    "new_message": "New message",
+                    "dry_run": True,
+                },
+            )
+
+            assert result["success"] is True
+            assert result["dry_run"] is True
+            assert result["new_message"] == "New message"
+
+    @pytest.mark.asyncio
+    async def test_commit_not_found(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = []
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_single_commit",
+                {
+                    "repo_path": "/tmp/repo",
+                    "commit_hash": "nonexistent",
+                    "new_message": "New message",
+                },
+            )
+
+            assert result["success"] is False
+            assert "not found" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_message_change_calls_adapter(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo(
+                    hash="abc123def456",
+                    author_name="Test",
+                    author_email="test@example.com",
+                    committer_name="Test",
+                    committer_email="test@example.com",
+                    message="Old message",
+                    date="2024-12-09",
+                )
+            ]
+            mock_adapter.rewrite_single_commit.return_value = FilterResult(
+                success=True,
+                message="Updated commit abc123de: message",
+                commits_rewritten=1,
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_single_commit",
+                {
+                    "repo_path": "/tmp/repo",
+                    "commit_hash": "abc123",
+                    "new_message": "New message",
+                    "dry_run": False,
+                },
+            )
+
+            assert result["success"] is True
+            mock_adapter.rewrite_single_commit.assert_called_once_with(
+                "abc123",
+                new_message="New message",
+                new_author_name=None,
+                new_author_email=None,
+            )
+
+
+class TestFilterPaths:
+    """Test filter_paths tool."""
+
+    @pytest.mark.asyncio
+    async def test_include_exclude_together_rejected(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.filter_paths.return_value = FilterResult(
+                success=False,
+                message="Cannot use include_paths and exclude_paths together",
+                error="git-filter-repo's --invert-paths is global",
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "filter_paths",
+                {
+                    "repo_path": "/tmp/repo",
+                    "include_paths": ["src/"],
+                    "exclude_paths": ["tests/"],
+                    "dry_run": True,
+                },
+            )
+
+            assert result["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_replace_text_dry_run(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.replace_text_in_history.return_value = FilterResult(
+                success=True,
+                message="Dry run: 3 files in history",
+                files_affected=["a.py", "b.py", "c.py"],
+                dry_run=True,
+            )
+            mock_adapter.create_backup.return_value = "backup_123"
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "replace_text_in_history",
+                {
+                    "repo_path": "/tmp/repo",
+                    "old_text": "old_value",
+                    "new_text": "new_value",
+                    "dry_run": True,
+                },
+            )
+
+            assert result["success"] is True
+            assert result["dry_run"] is True
