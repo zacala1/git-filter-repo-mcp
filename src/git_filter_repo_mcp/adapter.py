@@ -703,7 +703,7 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
             )
 
         # Generate new dates
-        date_mappings = {}  # commit_hash -> new_timestamp
+        date_mappings = {}  # commit_hash -> (new_timestamp, tz_offset_str)
 
         # Parse original dates and sort by date (oldest first)
         commit_dates = []
@@ -734,7 +734,11 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
         prev_timestamp = None
 
         for commit_hash, orig_dt in commit_dates:
+            # Preserve original timezone offset
+            tz_offset = orig_dt.strftime("%z") or "+0000"
+
             # Find next valid datetime
+            found_valid = False
             for _ in range(100):  # Max attempts to find valid date
                 # Generate random time within range
                 if end_hour >= start_hour:
@@ -773,9 +777,16 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
                         new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 60))
                         current_date = new_dt
 
+                found_valid = True
                 break
 
-            date_mappings[commit_hash] = int(new_dt.timestamp())
+            if not found_valid:
+                # Fallback: use prev_timestamp + offset to maintain ordering
+                if prev_timestamp:
+                    new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 30))
+                # else: new_dt from last loop iteration is used
+
+            date_mappings[commit_hash] = (int(new_dt.timestamp()), tz_offset)
             prev_timestamp = new_dt
 
             # Occasionally move to next day for variety
@@ -784,7 +795,7 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
 
         if dry_run:
             preview = []
-            for commit_hash, new_ts in list(date_mappings.items())[:10]:
+            for commit_hash, (new_ts, tz) in list(date_mappings.items())[:10]:
                 orig_commit = next((c for c in commits if c.hash == commit_hash), None)
                 if orig_commit:
                     new_dt = datetime.datetime.fromtimestamp(new_ts)
@@ -801,7 +812,9 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
             )
 
         # Create commit callback script
-        encoded_mappings = base64.b64encode(json.dumps(date_mappings).encode()).decode()
+        # Serialize as {hash: [timestamp, tz_offset]} for the callback
+        serializable_mappings = {h: [ts, tz] for h, (ts, tz) in date_mappings.items()}
+        encoded_mappings = base64.b64encode(json.dumps(serializable_mappings).encode()).decode()
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             # git-filter-repo exec's this with `commit` object in scope;
@@ -811,8 +824,8 @@ _DATA = "{encoded_mappings}"
 _DATE_MAP = json.loads(base64.b64decode(_DATA).decode())
 _commit_hash = commit.original_id.decode() if commit.original_id else None
 if _commit_hash and _commit_hash in _DATE_MAP:
-    _new_ts = _DATE_MAP[_commit_hash]
-    _new_date = f"{{_new_ts}} +0000".encode()
+    _new_ts, _tz_offset = _DATE_MAP[_commit_hash]
+    _new_date = f"{{_new_ts}} {{_tz_offset}}".encode()
     commit.author_date = _new_date
     commit.committer_date = _new_date
 ''')
