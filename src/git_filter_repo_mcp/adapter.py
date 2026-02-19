@@ -520,7 +520,7 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
             commit_files_map = {}
             current_hash = None
             for line in _parse_lines(result.stdout):
-                if len(line) == 40 and line.isalnum():
+                if len(line) == 40 and all(c in "0123456789abcdef" for c in line):
                     current_hash = line
                     commit_files_map[current_hash] = []
                 elif current_hash:
