@@ -273,9 +273,10 @@ async def _execute_tool(name: str, args: dict[str, Any]) -> dict:
     elif name == "rewrite_single_commit":
         try:
             adapter = create_adapter(args["repo_path"])
-            commits = adapter.get_commits(args["commit_hash"], max_count=1)
+            commit_hash = args["commit_hash"]
+            commits = adapter.get_commits(commit_hash, max_count=1)
             if not commits:
-                return {"success": False, "error": f"Commit not found: {args['commit_hash']}"}
+                return {"success": False, "error": f"Commit not found: {commit_hash}"}
 
             commit = commits[0]
             new_message = args.get("new_message")
