@@ -1,10 +1,9 @@
 """AI-powered commit message engine using Ollama, OpenAI, or Anthropic."""
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Protocol
+from typing import Protocol
 
 import httpx
 
@@ -422,45 +421,9 @@ class AICommitEngine:
             results.append(result)
         return results
 
-    def create_callback(self) -> Callable[[str, str], str]:
-        """Create callback for git-filter-repo."""
-        cache: dict[str, str] = {}
-        loop = asyncio.new_event_loop()
-
-        def callback(message: str, commit_hash: str) -> str:
-            if commit_hash in cache:
-                return cache[commit_hash]
-
-            try:
-                result = loop.run_until_complete(self.rewrite_message(message, commit_hash))
-                cache[commit_hash] = result.rewritten
-                return result.rewritten
-            except Exception as e:
-                logger.error(f"rewrite failed {commit_hash[:8]}: {e}")
-                return message
-
-        callback._loop = loop  # type: ignore
-        return callback
-
     async def close(self):
         if hasattr(self.provider, "close"):
             await self.provider.close()
-
-
-async def rewrite_with_ollama(
-    message: str,
-    commit_hash: str = "",
-    model: str = "llama3.2",
-    style: MessageStyle = MessageStyle.CONVENTIONAL,
-) -> str:
-    """Rewrite message with Ollama."""
-    provider = OllamaProvider(model=model)
-    engine = AICommitEngine(provider, style)
-    try:
-        result = await engine.rewrite_message(message, commit_hash)
-        return result.rewritten
-    finally:
-        await engine.close()
 
 
 def get_provider(

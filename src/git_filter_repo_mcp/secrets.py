@@ -5,7 +5,6 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Pattern
 
 
 @dataclass
@@ -13,7 +12,7 @@ class SecretPattern:
     """Pattern for detecting secrets."""
 
     name: str
-    pattern: Pattern
+    pattern: re.Pattern
     description: str
     severity: str = "high"  # high, medium, low
 
