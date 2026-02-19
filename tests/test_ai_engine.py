@@ -89,7 +89,7 @@ class TestAnthropicProvider:
         provider = AnthropicProvider(api_key="test-key")
         headers = provider.client.headers
         assert headers["x-api-key"] == "test-key"
-        assert headers["anthropic-version"] == "2024-01-01"
+        assert headers["anthropic-version"] == "2023-06-01"
 
     def test_build_prompt(self):
         context = CommitContext(

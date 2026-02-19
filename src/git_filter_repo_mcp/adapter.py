@@ -561,13 +561,6 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
             "sensitive_file_list": sensitive_files[:MAX_PREVIEW_COMMITS], "files_scanned": len(files_to_scan),
         }
 
-    def get_file_at_commit(self, commit_hash: str, file_path: str) -> str | None:
-        """Get file content at a specific commit."""
-        try:
-            return self._run_git_fast("show", f"{commit_hash}:{file_path}").stdout
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return None
-
     def list_all_files_in_history(self, limit: int = MAX_FILES_LIMIT) -> list[str]:
         """List all files that have ever existed."""
         files = set()

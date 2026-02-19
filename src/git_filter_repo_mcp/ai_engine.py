@@ -297,7 +297,7 @@ class AnthropicProvider(BaseProvider):
             timeout=30.0,
             headers={
                 "x-api-key": self.api_key,
-                "anthropic-version": "2024-01-01",
+                "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
         )
