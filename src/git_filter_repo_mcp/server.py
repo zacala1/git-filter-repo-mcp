@@ -316,6 +316,15 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         finally:
             await engine.close()
 
+    has_message_change = new_message and new_message != commit.message
+    has_author_change = params.new_author_email and params.new_author_name
+
+    if not has_message_change and not has_author_change and not params.dry_run:
+        return {
+            "success": False,
+            "error": "No changes specified. Provide new_message, use_ai=true, or new author info.",
+        }
+
     if params.dry_run:
         return {
             "success": True,
@@ -329,7 +338,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
 
     changes_made = []
 
-    if new_message and new_message != commit.message:
+    if has_message_change:
         def msg_callback(msg: str, h: str) -> str:
             if h.startswith(commit_hash) or commit_hash.startswith(h):
                 return new_message
@@ -341,7 +350,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         if result.success:
             changes_made.append("message")
 
-    if params.new_author_email and params.new_author_name:
+    if has_author_change:
         result = await asyncio.to_thread(
             adapter.change_author,
             old_email=commit.author_email,
