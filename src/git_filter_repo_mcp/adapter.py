@@ -561,6 +561,78 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
             "sensitive_file_list": sensitive_files[:MAX_PREVIEW_COMMITS], "files_scanned": len(files_to_scan),
         }
 
+    def rewrite_single_commit(
+        self,
+        commit_hash: str,
+        new_message: str | None = None,
+        new_author_name: str | None = None,
+        new_author_email: str | None = None,
+        force: bool = True,
+    ) -> FilterResult:
+        """Rewrite a single commit's message and/or author in one filter-repo pass."""
+        changes = {}
+        if new_message:
+            changes["message"] = new_message
+        if new_author_name:
+            changes["author_name"] = new_author_name
+        if new_author_email:
+            changes["author_email"] = new_author_email
+
+        if not changes:
+            return FilterResult(success=False, message="No changes specified")
+
+        encoded_changes = base64.b64encode(json.dumps(changes).encode()).decode()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            # git-filter-repo exec's this with `commit` object in scope.
+            # We check original_id to only modify the target commit.
+            f.write(f'''import base64, json
+_DATA = "{encoded_changes}"
+_CHANGES = json.loads(base64.b64decode(_DATA).decode())
+_TARGET = "{commit_hash}"
+_orig_id = commit.original_id.decode() if commit.original_id else None
+if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
+    if "message" in _CHANGES:
+        commit.message = _CHANGES["message"].encode()
+    if "author_name" in _CHANGES:
+        commit.author_name = _CHANGES["author_name"].encode()
+    if "author_email" in _CHANGES:
+        commit.author_email = b"<" + _CHANGES["author_email"].encode() + b">"
+    if "author_name" in _CHANGES:
+        commit.committer_name = _CHANGES["author_name"].encode()
+    if "author_email" in _CHANGES:
+        commit.committer_email = b"<" + _CHANGES["author_email"].encode() + b">"
+''')
+            script_path = f.name
+
+        try:
+            result = self._run_filter_repo(
+                "--commit-callback",
+                f"filename:{script_path}",
+                dry_run=False,
+                force=force,
+            )
+            if result.returncode != 0:
+                return FilterResult(
+                    success=False,
+                    message="Failed to rewrite commit",
+                    error=result.stderr,
+                )
+
+            changes_made = []
+            if new_message:
+                changes_made.append("message")
+            if new_author_name or new_author_email:
+                changes_made.append("author")
+
+            return FilterResult(
+                success=True,
+                message=f"Updated commit {commit_hash[:8]}: {', '.join(changes_made)}",
+                commits_rewritten=1,
+            )
+        finally:
+            Path(script_path).unlink(missing_ok=True)
+
     def list_all_files_in_history(self, limit: int = MAX_FILES_LIMIT) -> list[str]:
         """List all files that have ever existed."""
         files = set()

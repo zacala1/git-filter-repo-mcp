@@ -338,37 +338,14 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
             "new_author_email": params.new_author_email,
         }
 
-    changes_made = []
-
-    if has_message_change:
-        def msg_callback(msg: str, h: str) -> str:
-            if h.startswith(commit_hash) or commit_hash.startswith(h):
-                return new_message
-            return msg
-
-        result = await asyncio.to_thread(
-            adapter.rewrite_commit_messages, msg_callback, dry_run=False, force=True,
-        )
-        if result.success:
-            changes_made.append("message")
-
-    if has_author_change:
-        result = await asyncio.to_thread(
-            adapter.change_author,
-            old_email=commit.author_email,
-            new_name=params.new_author_name,
-            new_email=params.new_author_email,
-            dry_run=False,
-            force=True,
-        )
-        if result.success:
-            changes_made.append("author")
-
-    return {
-        "success": True,
-        "changes_made": changes_made,
-        "message": f"Updated commit {commit_hash[:8]}: {', '.join(changes_made)}",
-    }
+    result = await asyncio.to_thread(
+        adapter.rewrite_single_commit,
+        commit_hash,
+        new_message=new_message if has_message_change else None,
+        new_author_name=params.new_author_name if has_author_change else None,
+        new_author_email=params.new_author_email if has_author_change else None,
+    )
+    return result_to_dict(result)
 
 
 @tool_handler("scan_secrets")
