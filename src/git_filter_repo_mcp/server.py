@@ -9,6 +9,7 @@ from typing import Any, Callable
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
+from pydantic import ValidationError
 
 from .adapter import FilterResult, GitFilterRepoAdapter
 from .ai_engine import AICommitEngine, AIConnectionError, MessageStyle, get_provider
@@ -51,6 +52,13 @@ def tool_handler(name: str):
         async def wrapper(args: dict[str, Any]) -> dict:
             try:
                 return await func(args)
+            except ValidationError as e:
+                errors = e.errors()
+                details = "; ".join(
+                    f"{'.'.join(str(l) for l in err['loc'])}: {err['msg']}"
+                    for err in errors
+                )
+                return {"success": False, "error": f"Invalid input: {details}"}
             except (ValueError, RuntimeError) as e:
                 return {"success": False, "error": str(e)}
             except Exception as e:
