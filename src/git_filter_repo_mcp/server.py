@@ -13,7 +13,25 @@ from mcp.types import TextContent, Tool
 from .adapter import FilterResult, GitFilterRepoAdapter
 from .ai_engine import AICommitEngine, AIConnectionError, MessageStyle, get_provider
 from .config import get_config
-from .tools import TOOL_DEFINITIONS
+from .tools import (
+    TOOL_DEFINITIONS,
+    AnalyzeHistoryInput,
+    ChangeAuthorInput,
+    ChangeCommitDatesInput,
+    CreateBackupInput,
+    FilterPathsInput,
+    GetCommitDetailsInput,
+    GetFileHistoryInput,
+    ListAllFilesInput,
+    RemoveFilesInput,
+    RemoveLargeFilesInput,
+    ReplaceTextInput,
+    RestoreBackupInput,
+    RewriteCommitMessagesInput,
+    RewriteSingleCommitInput,
+    ScanSecretsInput,
+    SquashCommitsInput,
+)
 
 # Config and logging
 config = get_config()
@@ -22,46 +40,350 @@ logger = logging.getLogger(__name__)
 
 server = Server("git-filter-repo-mcp")
 
+# Tool handler registry
+_HANDLERS: dict[str, Callable] = {}
+
+
+def tool_handler(name: str):
+    """Register an async function as the handler for a named tool."""
+    def decorator(func: Callable):
+        @wraps(func)
+        async def wrapper(args: dict[str, Any]) -> dict:
+            try:
+                return await func(args)
+            except (ValueError, RuntimeError) as e:
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                logger.exception(f"{name} failed")
+                return {"success": False, "error": f"Internal error: {type(e).__name__}"}
+        _HANDLERS[name] = wrapper
+        return wrapper
+    return decorator
+
 
 def result_to_dict(result: FilterResult) -> dict:
     """FilterResult -> dict"""
     return {
-        "success": result.success, "message": result.message,
-        "commits_processed": result.commits_processed, "commits_rewritten": result.commits_rewritten,
-        "files_affected": result.files_affected, "dry_run": result.dry_run, "error": result.error,
+        "success": result.success,
+        "message": result.message,
+        "commits_processed": result.commits_processed,
+        "commits_rewritten": result.commits_rewritten,
+        "files_affected": result.files_affected,
+        "dry_run": result.dry_run,
+        "error": result.error,
     }
 
 
-def create_adapter(repo_path: str) -> GitFilterRepoAdapter:
-    """Create adapter with proper error handling."""
-    return GitFilterRepoAdapter(repo_path)
+def _create_ai_provider(args: dict, provider_name: str):
+    """Create an AI provider from args and config."""
+    return get_provider(
+        provider_name,
+        model=args.get("ai_model", config.ai.model),
+        api_key=config.ai.openai_api_key
+        if provider_name == "openai"
+        else config.ai.anthropic_api_key,
+        base_url=config.ai.ollama_base_url,
+    )
 
 
-def handle_errors(tool_name: str):
-    """Decorator for consistent error handling in tool handlers."""
-    def decorator(func: Callable):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            try:
-                return await func(*args, **kwargs)
-            except (ValueError, RuntimeError) as e:
-                return {"success": False, "error": str(e)}
-            except Exception as e:
-                logger.exception(f"{tool_name} failed")
-                return {"success": False, "error": str(e)}
-        return wrapper
-    return decorator
+async def _check_ai_connection(provider, provider_name: str) -> dict | None:
+    """Check AI connection, return error dict if failed, None if ok."""
+    if hasattr(provider, "check_connection"):
+        connected, status = await provider.check_connection()
+        if not connected:
+            return {
+                "success": False,
+                "error": f"AI ({provider_name}) connection failed: {status}",
+                "ai_provider": provider_name,
+            }
+    return None
+
+
+# --- Tool Handlers ---
+
+
+@tool_handler("analyze_git_history")
+async def _handle_analyze(args: dict) -> dict:
+    params = AnalyzeHistoryInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    return {"success": True, **adapter.analyze_history(params.branch, params.max_count)}
+
+
+@tool_handler("rewrite_commit_messages")
+async def _handle_rewrite_messages(args: dict) -> dict:
+    params = RewriteCommitMessagesInput(**args)
+    dry_run = params.dry_run
+    adapter = GitFilterRepoAdapter(params.repo_path)
+
+    if params.use_ai:
+        ai_provider_name = params.ai_provider or config.ai.provider
+        provider = _create_ai_provider(args, ai_provider_name)
+        engine = AICommitEngine(provider, MessageStyle(params.style))
+
+        try:
+            if err := await _check_ai_connection(provider, ai_provider_name):
+                return err
+
+            commits = adapter.get_commits(params.branch)
+            rewrites = []
+
+            for commit in commits:
+                files = adapter.get_commit_files(commit.hash)
+                result = await engine.rewrite_message(commit.message, commit.hash, files)
+                if result.rewritten != commit.message:
+                    rewrites.append({
+                        "hash": commit.hash,
+                        "hash_short": commit.hash[:8],
+                        "original": commit.message,
+                        "new": result.rewritten,
+                    })
+
+            if dry_run:
+                return {
+                    "success": True,
+                    "dry_run": True,
+                    "message": f"Would rewrite {len(rewrites)} commits",
+                    "commits_to_rewrite": [
+                        {"hash": r["hash_short"], "original": r["original"], "new": r["new"]}
+                        for r in rewrites[:20]
+                    ],
+                    "total_rewrites": len(rewrites),
+                    "ai_provider": ai_provider_name,
+                }
+
+            rewrite_by_hash = {r["hash"]: r["new"] for r in rewrites}
+
+            def sync_callback(msg: str, commit_hash: str) -> str:
+                return rewrite_by_hash.get(commit_hash, msg)
+
+            result = adapter.rewrite_commit_messages(
+                sync_callback, branch=params.branch, dry_run=False, force=True,
+            )
+            return result_to_dict(result)
+        except AIConnectionError as e:
+            return {"success": False, "error": str(e), "ai_provider": ai_provider_name}
+        finally:
+            await engine.close()
+
+    elif params.manual_mappings:
+        def callback(msg: str, _: str) -> str:
+            return params.manual_mappings.get(msg, msg)
+
+        result = adapter.rewrite_commit_messages(
+            callback, branch=params.branch, dry_run=dry_run, force=not dry_run,
+        )
+        return result_to_dict(result)
+
+    else:
+        return {"success": False, "error": "Either use_ai or manual_mappings must be provided"}
+
+
+@tool_handler("change_author")
+async def _handle_change_author(args: dict) -> dict:
+    params = ChangeAuthorInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    return result_to_dict(
+        adapter.change_author(params.old_email, params.new_name, params.new_email, params.dry_run, not params.dry_run)
+    )
+
+
+@tool_handler("remove_files_from_history")
+async def _handle_remove_files(args: dict) -> dict:
+    params = RemoveFilesInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    return result_to_dict(adapter.remove_files(params.paths, params.dry_run, not params.dry_run))
+
+
+@tool_handler("remove_large_files")
+async def _handle_remove_large_files(args: dict) -> dict:
+    params = RemoveLargeFilesInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    return result_to_dict(adapter.remove_large_files(params.size_threshold_mb, params.dry_run, not params.dry_run))
+
+
+@tool_handler("filter_paths")
+async def _handle_filter_paths(args: dict) -> dict:
+    params = FilterPathsInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    return result_to_dict(
+        adapter.filter_paths(params.include_paths, params.exclude_paths, params.dry_run, not params.dry_run)
+    )
+
+
+@tool_handler("create_backup")
+async def _handle_create_backup(args: dict) -> dict:
+    params = CreateBackupInput(**args)
+    backup = GitFilterRepoAdapter(params.repo_path).create_backup()
+    return {"success": True, "backup_branch": backup, "message": f"Backup: {backup}"}
+
+
+@tool_handler("restore_backup")
+async def _handle_restore_backup(args: dict) -> dict:
+    params = RestoreBackupInput(**args)
+    return result_to_dict(GitFilterRepoAdapter(params.repo_path).restore_backup(params.backup_branch))
+
+
+@tool_handler("get_commit_details")
+async def _handle_get_commit_details(args: dict) -> dict:
+    params = GetCommitDetailsInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    commits = adapter.get_commits(params.commit_hash, max_count=1)
+    if not commits:
+        return {"success": False, "error": f"Commit not found: {params.commit_hash}"}
+    c = commits[0]
+    return {
+        "success": True,
+        "commit": {
+            "hash": c.hash,
+            "author_name": c.author_name,
+            "author_email": c.author_email,
+            "committer_name": c.committer_name,
+            "committer_email": c.committer_email,
+            "message": c.message,
+            "date": c.date,
+            "files": adapter.get_commit_files(c.hash),
+        },
+        "diff_summary": (adapter.get_commit_diff(c.hash) or "")[:2000] or None,
+    }
+
+
+@tool_handler("rewrite_single_commit")
+async def _handle_rewrite_single_commit(args: dict) -> dict:
+    params = RewriteSingleCommitInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    commit_hash = params.commit_hash
+    commits = adapter.get_commits(commit_hash, max_count=1)
+    if not commits:
+        return {"success": False, "error": f"Commit not found: {commit_hash}"}
+
+    commit = commits[0]
+    new_message = params.new_message
+
+    if not new_message and params.use_ai:
+        ai_provider_name = params.ai_provider or config.ai.provider
+        provider = _create_ai_provider(args, ai_provider_name)
+        engine = AICommitEngine(provider, MessageStyle.CONVENTIONAL)
+        try:
+            if err := await _check_ai_connection(provider, ai_provider_name):
+                return err
+            files = adapter.get_commit_files(commit.hash)
+            result = await engine.rewrite_message(commit.message, commit.hash, files)
+            new_message = result.rewritten
+        except AIConnectionError as e:
+            return {"success": False, "error": str(e), "ai_provider": ai_provider_name}
+        finally:
+            await engine.close()
+
+    if params.dry_run:
+        return {
+            "success": True,
+            "dry_run": True,
+            "commit_hash": commit_hash,
+            "original_message": commit.message,
+            "new_message": new_message or commit.message,
+            "new_author_name": params.new_author_name,
+            "new_author_email": params.new_author_email,
+        }
+
+    changes_made = []
+
+    if new_message and new_message != commit.message:
+        def msg_callback(msg: str, h: str) -> str:
+            if h.startswith(commit_hash) or commit_hash.startswith(h):
+                return new_message
+            return msg
+
+        result = adapter.rewrite_commit_messages(msg_callback, dry_run=False, force=True)
+        if result.success:
+            changes_made.append("message")
+
+    if params.new_author_email and params.new_author_name:
+        result = adapter.change_author(
+            old_email=commit.author_email,
+            new_name=params.new_author_name,
+            new_email=params.new_author_email,
+            dry_run=False,
+            force=True,
+        )
+        if result.success:
+            changes_made.append("author")
+
+    return {
+        "success": True,
+        "changes_made": changes_made,
+        "message": f"Updated commit {commit_hash[:8]}: {', '.join(changes_made)}",
+    }
+
+
+@tool_handler("scan_secrets")
+async def _handle_scan_secrets(args: dict) -> dict:
+    params = ScanSecretsInput(**args)
+    return {"success": True, **GitFilterRepoAdapter(params.repo_path).scan_secrets(params.branch, params.max_commits)}
+
+
+@tool_handler("squash_commits")
+async def _handle_squash_commits(args: dict) -> dict:
+    params = SquashCommitsInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+    result = adapter.squash_commits(params.start_commit, params.end_commit, params.new_message, params.dry_run)
+    response = result_to_dict(result)
+    if backup:
+        response["backup_branch"] = backup
+    return response
+
+
+@tool_handler("replace_text_in_history")
+async def _handle_replace_text(args: dict) -> dict:
+    params = ReplaceTextInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+    result = adapter.replace_text_in_history(
+        params.old_text, params.new_text, params.file_pattern, params.dry_run, not params.dry_run,
+    )
+    response = result_to_dict(result)
+    if backup:
+        response["backup_branch"] = backup
+    return response
+
+
+@tool_handler("get_file_history")
+async def _handle_get_file_history(args: dict) -> dict:
+    params = GetFileHistoryInput(**args)
+    history = GitFilterRepoAdapter(params.repo_path).get_file_history(params.file_path)
+    return {"success": True, "file_path": params.file_path, "commits": history, "total_commits": len(history)}
+
+
+@tool_handler("list_all_files_in_history")
+async def _handle_list_all_files(args: dict) -> dict:
+    params = ListAllFilesInput(**args)
+    files = GitFilterRepoAdapter(params.repo_path).list_all_files_in_history()
+    return {"success": True, "files": files[:500], "total_files": len(files), "truncated": len(files) > 500}
+
+
+@tool_handler("change_commit_dates")
+async def _handle_change_dates(args: dict) -> dict:
+    params = ChangeCommitDatesInput(**args)
+    adapter = GitFilterRepoAdapter(params.repo_path)
+    backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+    result = adapter.change_commit_dates(
+        params.time_range, params.weekend_only, params.preserve_order,
+        params.start_date, dry_run=params.dry_run, force=not params.dry_run,
+    )
+    response = result_to_dict(result)
+    if backup:
+        response["backup_branch"] = backup
+    return response
+
+
+# --- MCP Protocol ---
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """Return tool list."""
     return [
-        Tool(
-            name=tool["name"],
-            description=tool["description"],
-            inputSchema=tool["inputSchema"],
-        )
+        Tool(name=tool["name"], description=tool["description"], inputSchema=tool["inputSchema"])
         for tool in TOOL_DEFINITIONS
     ]
 
@@ -78,376 +400,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 
 async def _execute_tool(name: str, args: dict[str, Any]) -> dict:
-    """Execute tool."""
+    """Dispatch tool execution to registered handler."""
     logger.info(f"tool: {name}")
-    dry_run = args.get("dry_run", config.server.default_dry_run)
-
-    if name == "analyze_git_history":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            return {"success": True, **adapter.analyze_history(args.get("branch", "HEAD"), args.get("max_count", 100))}
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("analyze_git_history failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "rewrite_commit_messages":
-        try:
-            adapter = create_adapter(args["repo_path"])
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        use_ai = args.get("use_ai", True)
-        manual_mappings = args.get("manual_mappings")
-
-        if use_ai:
-            style = MessageStyle(args.get("style", "conventional"))
-            ai_provider_name = args.get("ai_provider", config.ai.provider)
-            provider = get_provider(
-                ai_provider_name,
-                model=args.get("ai_model", config.ai.model),
-                api_key=config.ai.openai_api_key
-                if ai_provider_name == "openai"
-                else config.ai.anthropic_api_key,
-                base_url=config.ai.ollama_base_url,
-            )
-            engine = AICommitEngine(provider, style)
-
-            try:
-                if hasattr(provider, "check_connection"):
-                    connected, status = await provider.check_connection()
-                    if not connected:
-                        return {
-                            "success": False,
-                            "error": f"AI ({ai_provider_name}) connection failed: {status}",
-                            "ai_provider": ai_provider_name,
-                        }
-
-                async def ai_callback(message: str, commit_hash: str) -> str:
-                    files = adapter.get_commit_files(commit_hash)
-                    result = await engine.rewrite_message(message, commit_hash, files)
-                    return result.rewritten
-
-                commits = adapter.get_commits(args.get("branch", "HEAD"))
-                rewrites = []
-
-                for commit in commits:
-                    new_message = await ai_callback(commit.message, commit.hash)
-                    if new_message != commit.message:
-                        rewrites.append(
-                            {
-                                "hash": commit.hash,
-                                "hash_short": commit.hash[:8],
-                                "original": commit.message,
-                                "new": new_message,
-                            }
-                        )
-
-                if dry_run:
-                    return {
-                        "success": True,
-                        "dry_run": True,
-                        "message": f"Would rewrite {len(rewrites)} commits",
-                        "commits_to_rewrite": [
-                            {"hash": r["hash_short"], "original": r["original"], "new": r["new"]}
-                            for r in rewrites[:20]
-                        ],
-                        "total_rewrites": len(rewrites),
-                        "ai_provider": ai_provider_name,
-                    }
-
-                rewrite_by_hash = {r["hash"]: r["new"] for r in rewrites}
-
-                def sync_callback(msg: str, commit_hash: str) -> str:
-                    return rewrite_by_hash.get(commit_hash, msg)
-
-                result = adapter.rewrite_commit_messages(
-                    sync_callback,
-                    branch=args.get("branch", "HEAD"),
-                    dry_run=False,
-                    force=True,
-                )
-                return result_to_dict(result)
-            except AIConnectionError as e:
-                return {
-                    "success": False,
-                    "error": str(e),
-                    "ai_provider": ai_provider_name,
-                }
-            finally:
-                await engine.close()
-
-        elif manual_mappings:
-            def callback(msg: str, _: str) -> str:
-                return manual_mappings.get(msg, msg)
-
-            result = adapter.rewrite_commit_messages(
-                callback,
-                branch=args.get("branch", "HEAD"),
-                dry_run=dry_run,
-                force=not dry_run,
-            )
-            return result_to_dict(result)
-
-        else:
-            return {"error": "Either use_ai or manual_mappings must be provided"}
-
-    elif name == "change_author":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            return result_to_dict(adapter.change_author(args["old_email"], args["new_name"], args["new_email"], dry_run, not dry_run))
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("change_author failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "remove_files_from_history":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            return result_to_dict(adapter.remove_files(args["paths"], dry_run, not dry_run))
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("remove_files_from_history failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "remove_large_files":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            return result_to_dict(adapter.remove_large_files(args.get("size_threshold_mb", 10.0), dry_run, not dry_run))
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("remove_large_files failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "filter_paths":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            return result_to_dict(adapter.filter_paths(args.get("include_paths"), args.get("exclude_paths"), dry_run, not dry_run))
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("filter_paths failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "create_backup":
-        try:
-            backup = create_adapter(args["repo_path"]).create_backup()
-            return {"success": True, "backup_branch": backup, "message": f"Backup: {backup}"}
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("create_backup failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "restore_backup":
-        try:
-            return result_to_dict(create_adapter(args["repo_path"]).restore_backup(args["backup_branch"]))
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("restore_backup failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "get_commit_details":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            commits = adapter.get_commits(args["commit_hash"], max_count=1)
-            if not commits:
-                return {"success": False, "error": f"Commit not found: {args['commit_hash']}"}
-            c = commits[0]
-            return {
-                "success": True,
-                "commit": {
-                    "hash": c.hash, "author_name": c.author_name, "author_email": c.author_email,
-                    "committer_name": c.committer_name, "committer_email": c.committer_email,
-                    "message": c.message, "date": c.date, "files": adapter.get_commit_files(c.hash),
-                },
-                "diff_summary": (adapter.get_commit_diff(c.hash) or "")[:2000] or None,
-            }
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("get_commit_details failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "rewrite_single_commit":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            commit_hash = args["commit_hash"]
-            commits = adapter.get_commits(commit_hash, max_count=1)
-            if not commits:
-                return {"success": False, "error": f"Commit not found: {commit_hash}"}
-
-            commit = commits[0]
-            new_message = args.get("new_message")
-
-            if not new_message and args.get("use_ai"):
-                ai_provider_name = args.get("ai_provider", config.ai.provider)
-                provider = get_provider(
-                    ai_provider_name,
-                    model=args.get("ai_model", config.ai.model),
-                    api_key=config.ai.openai_api_key
-                    if ai_provider_name == "openai"
-                    else config.ai.anthropic_api_key,
-                    base_url=config.ai.ollama_base_url,
-                )
-                engine = AICommitEngine(provider, MessageStyle.CONVENTIONAL)
-                try:
-                    if hasattr(provider, "check_connection"):
-                        connected, status = await provider.check_connection()
-                        if not connected:
-                            return {
-                                "success": False,
-                                "error": f"AI ({ai_provider_name}) connection failed: {status}",
-                                "ai_provider": ai_provider_name,
-                            }
-
-                    files = adapter.get_commit_files(commit.hash)
-                    result = await engine.rewrite_message(commit.message, commit.hash, files)
-                    new_message = result.rewritten
-                except AIConnectionError as e:
-                    return {
-                        "success": False,
-                        "error": str(e),
-                        "ai_provider": ai_provider_name,
-                    }
-                finally:
-                    await engine.close()
-
-            if dry_run:
-                return {
-                    "success": True,
-                    "dry_run": True,
-                    "commit_hash": commit_hash,
-                    "original_message": commit.message,
-                    "new_message": new_message or commit.message,
-                    "new_author_name": args.get("new_author_name"),
-                    "new_author_email": args.get("new_author_email"),
-                }
-
-            changes_made = []
-
-            if new_message and new_message != commit.message:
-
-                def msg_callback(msg: str, h: str) -> str:
-                    if h.startswith(commit_hash) or commit_hash.startswith(h):
-                        return new_message
-                    return msg
-
-                result = adapter.rewrite_commit_messages(
-                    msg_callback,
-                    dry_run=False,
-                    force=True,
-                )
-                if result.success:
-                    changes_made.append("message")
-
-            if args.get("new_author_email") and args.get("new_author_name"):
-                result = adapter.change_author(
-                    old_email=commit.author_email,
-                    new_name=args["new_author_name"],
-                    new_email=args["new_author_email"],
-                    dry_run=False,
-                    force=True,
-                )
-                if result.success:
-                    changes_made.append("author")
-
-            return {
-                "success": True,
-                "changes_made": changes_made,
-                "message": f"Updated commit {commit_hash[:8]}: {', '.join(changes_made)}",
-            }
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("rewrite_single_commit failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "scan_secrets":
-        try:
-            return {"success": True, **create_adapter(args["repo_path"]).scan_secrets(args.get("branch", "HEAD"), args.get("max_commits", 100))}
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("scan_secrets failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "squash_commits":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            backup = adapter.create_backup() if config.server.auto_backup and not dry_run else None
-            result = adapter.squash_commits(args["start_commit"], args.get("end_commit", "HEAD"), args.get("new_message"), dry_run)
-            response = result_to_dict(result)
-            if backup:
-                response["backup_branch"] = backup
-            return response
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("squash_commits failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "replace_text_in_history":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            backup = adapter.create_backup() if config.server.auto_backup and not dry_run else None
-            result = adapter.replace_text_in_history(args["old_text"], args["new_text"], args.get("file_pattern"), dry_run, not dry_run)
-            response = result_to_dict(result)
-            if backup:
-                response["backup_branch"] = backup
-            return response
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("replace_text_in_history failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "get_file_history":
-        try:
-            history = create_adapter(args["repo_path"]).get_file_history(args["file_path"])
-            return {"success": True, "file_path": args["file_path"], "commits": history, "total_commits": len(history)}
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("get_file_history failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "list_all_files_in_history":
-        try:
-            files = create_adapter(args["repo_path"]).list_all_files_in_history()
-            return {"success": True, "files": files[:500], "total_files": len(files), "truncated": len(files) > 500}
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("list_all_files_in_history failed")
-            return {"success": False, "error": str(e)}
-
-    elif name == "change_commit_dates":
-        try:
-            adapter = create_adapter(args["repo_path"])
-            backup = adapter.create_backup() if config.server.auto_backup and not dry_run else None
-            result = adapter.change_commit_dates(
-                args.get("time_range", "evening"), args.get("weekend_only", False),
-                args.get("preserve_order", True), args.get("start_date"),
-                dry_run=dry_run,
-                force=not dry_run,
-            )
-
-            response = result_to_dict(result)
-            if backup:
-                response["backup_branch"] = backup
-            return response
-        except (ValueError, RuntimeError) as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            logger.exception("change_commit_dates failed")
-            return {"success": False, "error": str(e)}
-
-    return {"error": f"Unknown tool: {name}"}
+    handler = _HANDLERS.get(name)
+    if handler is None:
+        return {"success": False, "error": f"Unknown tool: {name}"}
+    return await handler(args)
 
 
 async def run_server():
