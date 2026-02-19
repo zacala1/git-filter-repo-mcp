@@ -47,7 +47,7 @@ SECRET_PATTERNS: list[SecretPattern] = [
     ),
     SecretPattern(
         name="openai_api_key",
-        pattern=re.compile(r"sk-[A-Za-z0-9]{48,}"),
+        pattern=re.compile(r"sk-(?!ant-)[A-Za-z0-9]{48,}"),
         description="OpenAI API Key",
         severity="high",
     ),
@@ -214,9 +214,17 @@ def scan_content(
         return []
 
     findings = []
+    # Deduplicate by (line_number, match_span) to avoid reporting the same
+    # text region under multiple overlapping patterns.
+    seen_spans: set[tuple[int, int]] = set()
 
     for pattern in SECRET_PATTERNS:
         for match in pattern.pattern.finditer(content):
+            span = (match.start(), match.end())
+            # Skip if this exact span was already reported or overlaps a previous one
+            if any(s[0] <= span[0] < s[1] or s[0] < span[1] <= s[1] for s in seen_spans):
+                continue
+
             matched_text = match.group(0)
 
             # Get line number
@@ -227,6 +235,7 @@ def scan_content(
             end = min(len(content), match.end() + 20)
             context = content[start:end].replace("\n", " ")
 
+            seen_spans.add(span)
             findings.append(
                 SecretFinding(
                     pattern_name=pattern.name,
