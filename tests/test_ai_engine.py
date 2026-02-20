@@ -1,7 +1,8 @@
 """AI engine tests."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from git_filter_repo_mcp.ai_engine import (
@@ -291,3 +292,132 @@ class TestRewriteBatch:
         results = await engine.rewrite_batch(commits, max_concurrency=3)
         assert len(results) == 10
         assert max_concurrent <= 3
+
+
+def _make_mock_response(status_code=200, json_data=None, text=""):
+    """Create a mock httpx.Response (sync methods like json/raise_for_status)."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_data or {}
+    resp.text = text
+    if status_code >= 400:
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "error", request=MagicMock(), response=resp
+        )
+    return resp
+
+
+class TestOllamaProviderHTTP:
+    """Test Ollama provider HTTP flows with mocked httpx."""
+
+    @pytest.mark.asyncio
+    async def test_generate_message_success(self):
+        provider = OllamaProvider()
+        provider.client = AsyncMock()
+        provider.client.post.return_value = _make_mock_response(
+            json_data={"response": "feat: add new feature"}
+        )
+        ctx = CommitContext(original_message="add feature", commit_hash="abc", files_changed=["a.py"])
+        result = await provider.generate_message(ctx, MessageStyle.CONVENTIONAL)
+        assert result == "feat: add new feature"
+        provider.client.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_generate_message_connect_error_raises(self):
+        provider = OllamaProvider(raise_on_error=True)
+        provider.client = AsyncMock()
+        provider.client.post.side_effect = httpx.ConnectError("Connection refused")
+        ctx = CommitContext(original_message="test", commit_hash="abc", files_changed=[])
+        with pytest.raises(AIConnectionError, match="Ollama"):
+            await provider.generate_message(ctx, MessageStyle.SIMPLE)
+
+    @pytest.mark.asyncio
+    async def test_generate_message_connect_error_fallback(self):
+        provider = OllamaProvider(raise_on_error=False)
+        provider.client = AsyncMock()
+        provider.client.post.side_effect = httpx.ConnectError("Connection refused")
+        ctx = CommitContext(original_message="original msg", commit_hash="abc", files_changed=[])
+        result = await provider.generate_message(ctx, MessageStyle.SIMPLE)
+        assert result == "original msg"
+        assert provider._last_error is not None
+
+    @pytest.mark.asyncio
+    async def test_check_connection_success(self):
+        provider = OllamaProvider(model="llama3.2")
+        provider.client = AsyncMock()
+        provider.client.get.return_value = _make_mock_response(
+            json_data={"models": [{"name": "llama3.2:latest"}]}
+        )
+        connected, status = await provider.check_connection()
+        assert connected is True
+        assert status == "Connected"
+
+    @pytest.mark.asyncio
+    async def test_check_connection_model_not_found(self):
+        provider = OllamaProvider(model="nonexistent")
+        provider.client = AsyncMock()
+        provider.client.get.return_value = _make_mock_response(
+            json_data={"models": [{"name": "llama3.2:latest"}]}
+        )
+        connected, status = await provider.check_connection()
+        assert connected is False
+        assert "not found" in status
+
+
+class TestOpenAIProviderHTTP:
+    """Test OpenAI provider HTTP flows with mocked httpx."""
+
+    @pytest.mark.asyncio
+    async def test_generate_message_success(self):
+        provider = OpenAIProvider(api_key="test-key")
+        provider.client = AsyncMock()
+        provider.client.post.return_value = _make_mock_response(
+            json_data={"choices": [{"message": {"content": "fix: resolve null pointer"}}]}
+        )
+        ctx = CommitContext(original_message="fix bug", commit_hash="abc", files_changed=["main.py"])
+        result = await provider.generate_message(ctx, MessageStyle.CONVENTIONAL)
+        assert result == "fix: resolve null pointer"
+
+    @pytest.mark.asyncio
+    async def test_check_connection_invalid_key(self):
+        provider = OpenAIProvider(api_key="bad-key")
+        provider.client = AsyncMock()
+        provider.client.get.return_value = _make_mock_response(status_code=401)
+        connected, status = await provider.check_connection()
+        assert connected is False
+        assert "Invalid API key" in status
+
+    @pytest.mark.asyncio
+    async def test_unexpected_response_raises(self):
+        provider = OpenAIProvider(api_key="test-key", raise_on_error=True)
+        provider.client = AsyncMock()
+        provider.client.post.return_value = _make_mock_response(
+            json_data={"unexpected": "format"}
+        )
+        ctx = CommitContext(original_message="test", commit_hash="abc", files_changed=[])
+        with pytest.raises(AIConnectionError, match="OpenAI"):
+            await provider.generate_message(ctx, MessageStyle.SIMPLE)
+
+
+class TestAnthropicProviderHTTP:
+    """Test Anthropic provider HTTP flows with mocked httpx."""
+
+    @pytest.mark.asyncio
+    async def test_generate_message_success(self):
+        provider = AnthropicProvider(api_key="test-key")
+        provider.client = AsyncMock()
+        provider.client.post.return_value = _make_mock_response(
+            json_data={"content": [{"text": "docs: update README"}]}
+        )
+        ctx = CommitContext(original_message="update readme", commit_hash="abc", files_changed=["README.md"])
+        result = await provider.generate_message(ctx, MessageStyle.CONVENTIONAL)
+        assert result == "docs: update README"
+
+    @pytest.mark.asyncio
+    async def test_check_connection_rate_limited_is_ok(self):
+        provider = AnthropicProvider(api_key="test-key")
+        provider.client = AsyncMock()
+        provider.client.post.return_value = _make_mock_response(status_code=429)
+        connected, status = await provider.check_connection()
+        assert connected is True
+        assert status == "Connected"
