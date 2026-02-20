@@ -331,7 +331,7 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
             try:
                 result = self._run_git("log", "--all", "--format=%H", "--", *paths)
                 affected = set(_parse_lines(result.stdout))
-            except Exception:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 affected = set()
                 for path in paths:
                     result = self._run_git("log", "--all", "--format=%H", "--", path)
@@ -381,7 +381,7 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
                 size = _safe_int(size_str)
                 if size > size_bytes:
                     large_files.append((objects_with_paths.get(blob_hash, blob_hash), size / (1024 * 1024)))
-        except Exception as e:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.warning(f"batch failed: {e}")
             for blob_hash in object_hashes[:100]:
                 try:
@@ -525,7 +525,7 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
                     commit_files_map[current_hash] = []
                 elif current_hash:
                     commit_files_map[current_hash].append(line)
-        except Exception:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             commit_files_map = {c.hash: self.get_commit_files(c.hash) for c in commits[:20]}
 
         # Collect files to scan
@@ -690,7 +690,7 @@ if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
                     git_args.extend(["--", file_pattern])
                 result = self._run_git(*git_args)
                 files_with_matches = sorted(set(_parse_lines(result.stdout)))
-            except Exception:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 files_with_matches = []
             Path(expressions_path).unlink(missing_ok=True)
             return FilterResult(success=True, message=f"Dry run: {len(files_with_matches)} files in history", files_affected=files_with_matches[:20], dry_run=True)
