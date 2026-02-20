@@ -12,6 +12,7 @@ from git_filter_repo_mcp.server import (
     list_tools,
     result_to_dict,
 )
+from git_filter_repo_mcp.tools import ErrorCode
 
 
 class TestResultToDict:
@@ -125,6 +126,7 @@ class TestExecuteTool:
         result = await _execute_tool("unknown_tool", {})
         assert "error" in result
         assert "Unknown tool" in result["error"]
+        assert result["error_code"] == ErrorCode.TOOL_NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_analyze_git_history(self):
@@ -418,6 +420,7 @@ class TestRewriteCommitMessages:
 
             assert "error" in result
             assert "manual_mappings" in result["error"]
+            assert result["error_code"] == ErrorCode.INVALID_INPUT
 
 
 class TestValidationErrorHandling:
@@ -429,6 +432,7 @@ class TestValidationErrorHandling:
         assert result["success"] is False
         assert "Invalid input" in result["error"]
         assert "repo_path" in result["error"]
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
 
     @pytest.mark.asyncio
     async def test_wrong_type(self):
@@ -438,6 +442,7 @@ class TestValidationErrorHandling:
         )
         assert result["success"] is False
         assert "Invalid input" in result["error"]
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
 
     @pytest.mark.asyncio
     async def test_missing_required_field_change_author(self):
@@ -447,6 +452,7 @@ class TestValidationErrorHandling:
         )
         assert result["success"] is False
         assert "Invalid input" in result["error"]
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
 
 
 class TestRewriteSingleCommit:
@@ -480,6 +486,7 @@ class TestRewriteSingleCommit:
 
             assert result["success"] is False
             assert "No changes specified" in result["error"]
+            assert result["error_code"] == ErrorCode.NO_CHANGES
 
     @pytest.mark.asyncio
     async def test_dry_run_shows_changes(self):

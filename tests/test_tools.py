@@ -1,6 +1,6 @@
 """Tests for MCP tool definitions."""
 
-from git_filter_repo_mcp.tools import TOOL_DEFINITIONS
+from git_filter_repo_mcp.tools import TOOL_DEFINITIONS, ErrorCode
 
 
 class TestToolDefinitions:
@@ -72,3 +72,25 @@ class TestToolDefinitions:
                 assert "dry_run" in properties, (
                     f"Dangerous tool {tool['name']} missing dry_run parameter"
                 )
+
+
+class TestErrorCode:
+    """Test ErrorCode enum."""
+
+    def test_all_codes_defined(self):
+        expected = {
+            "INVALID_INPUT", "REPO_NOT_FOUND", "TOOL_NOT_FOUND",
+            "COMMAND_FAILED", "AI_CONNECTION_FAILED", "NO_CHANGES", "INTERNAL_ERROR",
+        }
+        actual = {code.value for code in ErrorCode}
+        assert actual == expected
+
+    def test_string_enum(self):
+        assert isinstance(ErrorCode.INVALID_INPUT, str)
+        assert ErrorCode.INVALID_INPUT == "INVALID_INPUT"
+
+    def test_serializable_in_json(self):
+        import json
+        data = {"error_code": ErrorCode.REPO_NOT_FOUND}
+        serialized = json.dumps(data)
+        assert '"REPO_NOT_FOUND"' in serialized

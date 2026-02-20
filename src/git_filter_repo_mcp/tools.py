@@ -1,6 +1,20 @@
 """MCP tool definitions for git-filter-repo operations."""
 
+from enum import Enum
+
 from pydantic import BaseModel, Field
+
+
+class ErrorCode(str, Enum):
+    """Structured error codes for MCP tool responses."""
+
+    INVALID_INPUT = "INVALID_INPUT"
+    REPO_NOT_FOUND = "REPO_NOT_FOUND"
+    TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
+    COMMAND_FAILED = "COMMAND_FAILED"
+    AI_CONNECTION_FAILED = "AI_CONNECTION_FAILED"
+    NO_CHANGES = "NO_CHANGES"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
 class AnalyzeHistoryInput(BaseModel):

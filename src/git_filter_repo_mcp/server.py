@@ -17,6 +17,7 @@ from .config import get_config
 from .tools import (
     TOOL_DEFINITIONS,
     AnalyzeHistoryInput,
+    ErrorCode,
     ChangeAuthorInput,
     ChangeCommitDatesInput,
     CreateBackupInput,
@@ -58,12 +59,16 @@ def tool_handler(name: str):
                     f"{'.'.join(str(l) for l in err['loc'])}: {err['msg']}"
                     for err in errors
                 )
-                return {"success": False, "error": f"Invalid input: {details}"}
-            except (ValueError, RuntimeError) as e:
-                return {"success": False, "error": str(e)}
+                return {"success": False, "error": f"Invalid input: {details}", "error_code": ErrorCode.INVALID_INPUT}
+            except ValueError as e:
+                msg = str(e)
+                code = ErrorCode.REPO_NOT_FOUND if "Not a git repository" in msg else ErrorCode.COMMAND_FAILED
+                return {"success": False, "error": msg, "error_code": code}
+            except RuntimeError as e:
+                return {"success": False, "error": str(e), "error_code": ErrorCode.COMMAND_FAILED}
             except Exception as e:
                 logger.exception(f"{name} failed")
-                return {"success": False, "error": f"Internal error: {type(e).__name__}"}
+                return {"success": False, "error": f"Internal error: {type(e).__name__}", "error_code": ErrorCode.INTERNAL_ERROR}
         _HANDLERS[name] = wrapper
         return wrapper
     return decorator
@@ -104,6 +109,7 @@ async def _check_ai_connection(provider, provider_name: str) -> dict | None:
             return {
                 "success": False,
                 "error": f"AI ({provider_name}) connection failed: {status}",
+                "error_code": ErrorCode.AI_CONNECTION_FAILED,
                 "ai_provider": provider_name,
             }
     return None
@@ -176,7 +182,7 @@ async def _handle_rewrite_messages(args: dict) -> dict:
             )
             return result_to_dict(result)
         except AIConnectionError as e:
-            return {"success": False, "error": str(e), "ai_provider": ai_provider_name}
+            return {"success": False, "error": str(e), "error_code": ErrorCode.AI_CONNECTION_FAILED, "ai_provider": ai_provider_name}
         finally:
             await engine.close()
 
@@ -191,7 +197,7 @@ async def _handle_rewrite_messages(args: dict) -> dict:
         return result_to_dict(result)
 
     else:
-        return {"success": False, "error": "Either use_ai or manual_mappings must be provided"}
+        return {"success": False, "error": "Either use_ai or manual_mappings must be provided", "error_code": ErrorCode.INVALID_INPUT}
 
 
 @tool_handler("change_author")
@@ -271,7 +277,7 @@ async def _handle_get_commit_details(args: dict) -> dict:
         adapter = GitFilterRepoAdapter(params.repo_path)
         commits = adapter.get_commits(params.commit_hash, max_count=1)
         if not commits:
-            return {"success": False, "error": f"Commit not found: {params.commit_hash}"}
+            return {"success": False, "error": f"Commit not found: {params.commit_hash}", "error_code": ErrorCode.INVALID_INPUT}
         c = commits[0]
         return {
             "success": True,
@@ -298,7 +304,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
     commit_hash = params.commit_hash
     commits = await asyncio.to_thread(adapter.get_commits, commit_hash, 1)
     if not commits:
-        return {"success": False, "error": f"Commit not found: {commit_hash}"}
+        return {"success": False, "error": f"Commit not found: {commit_hash}", "error_code": ErrorCode.INVALID_INPUT}
 
     commit = commits[0]
     new_message = params.new_message
@@ -314,7 +320,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
             result = await engine.rewrite_message(commit.message, commit.hash, files)
             new_message = result.rewritten
         except AIConnectionError as e:
-            return {"success": False, "error": str(e), "ai_provider": ai_provider_name}
+            return {"success": False, "error": str(e), "error_code": ErrorCode.AI_CONNECTION_FAILED, "ai_provider": ai_provider_name}
         finally:
             await engine.close()
 
@@ -325,6 +331,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         return {
             "success": False,
             "error": "No changes specified. Provide new_message, use_ai=true, or new author info.",
+            "error_code": ErrorCode.NO_CHANGES,
         }
 
     if params.dry_run:
@@ -461,7 +468,7 @@ async def _execute_tool(name: str, args: dict[str, Any]) -> dict:
     logger.info(f"tool: {name}")
     handler = _HANDLERS.get(name)
     if handler is None:
-        return {"success": False, "error": f"Unknown tool: {name}"}
+        return {"success": False, "error": f"Unknown tool: {name}", "error_code": ErrorCode.TOOL_NOT_FOUND}
     return await handler(args)
 
 

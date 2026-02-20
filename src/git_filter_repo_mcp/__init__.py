@@ -15,6 +15,7 @@ from .ai_engine import (
 )
 from .config import AIConfig, Config, ServerConfig, get_config, reload_config
 from .secrets import SecretFinding, SecretPattern, redact_secret, scan_content
+from .tools import ErrorCode
 
 __all__ = [
     # Version
@@ -43,4 +44,6 @@ __all__ = [
     "SecretFinding",
     "scan_content",
     "redact_secret",
+    # Tools
+    "ErrorCode",
 ]
