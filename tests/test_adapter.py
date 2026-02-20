@@ -1,6 +1,5 @@
 """Adapter tests."""
 
-import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -9,11 +8,11 @@ from unittest.mock import patch
 import pytest
 
 from git_filter_repo_mcp.adapter import FilterResult, GitFilterRepoAdapter
+from tests.conftest import requires_git_filter_repo
 
 
 class TestPathNormalization:
     def test_linux_absolute_path_preserved_on_windows(self):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         with patch("platform.system", return_value="Windows"):
             assert GitFilterRepoAdapter._normalize_path("/root/test-repo") == "/root/test-repo"
@@ -21,95 +20,43 @@ class TestPathNormalization:
             assert GitFilterRepoAdapter._normalize_path("/tmp/test") == "/tmp/test"
 
     def test_git_bash_path_converted_on_windows(self):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         with patch("platform.system", return_value="Windows"):
             assert GitFilterRepoAdapter._normalize_path("/c/Users/test") == "C:\\Users\\test"
             assert GitFilterRepoAdapter._normalize_path("/d/Projects/repo") == "D:\\Projects\\repo"
 
     def test_windows_path_with_forward_slashes(self):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         with patch("platform.system", return_value="Windows"):
             assert GitFilterRepoAdapter._normalize_path("C:/Users/test") == "C:\\Users\\test"
 
     def test_wsl_paths_preserved(self):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         with patch("platform.system", return_value="Windows"):
             assert GitFilterRepoAdapter._normalize_path("//wsl$/Ubuntu/home/user") == "//wsl$/Ubuntu/home/user"
 
     def test_paths_unchanged_on_linux(self):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         with patch("platform.system", return_value="Linux"):
             assert GitFilterRepoAdapter._normalize_path("/c/Users/test") == "/c/Users/test"
             assert GitFilterRepoAdapter._normalize_path("/root/test") == "/root/test"
 
 
-# Marker for tests requiring git-filter-repo
-_requires_git_filter_repo = pytest.mark.skipif(
-    not any(
-        (Path(p) / "git-filter-repo").exists() or (Path(p) / "git-filter-repo.exe").exists()
-        for p in os.environ.get("PATH", "").split(os.pathsep)
-    ),
-    reason="git-filter-repo not installed",
-)
-
-
-@pytest.fixture
-def temp_git_repo():
-    """Create a temporary git repository for testing."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        repo_path = Path(tmpdir) / "test_repo"
-        repo_path.mkdir()
-
-        # Initialize git repo
-        subprocess.run(["git", "init"], cwd=repo_path, capture_output=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@example.com"], cwd=repo_path, capture_output=True
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Test User"], cwd=repo_path, capture_output=True
-        )
-
-        # Create initial commit
-        (repo_path / "README.md").write_text("# Test Repo")
-        subprocess.run(["git", "add", "."], cwd=repo_path, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", "Initial commit"], cwd=repo_path, capture_output=True
-        )
-
-        # Create more commits
-        (repo_path / "main.py").write_text("print('hello')")
-        subprocess.run(["git", "add", "."], cwd=repo_path, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "Add main.py"], cwd=repo_path, capture_output=True)
-
-        (repo_path / "config.json").write_text('{"key": "value"}')
-        subprocess.run(["git", "add", "."], cwd=repo_path, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "Add config"], cwd=repo_path, capture_output=True)
-
-        yield repo_path
-
-
-@_requires_git_filter_repo
+@requires_git_filter_repo
 class TestGitFilterRepoAdapter:
     def test_validate_repo(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         # Should not raise
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         assert adapter.repo_path == temp_git_repo.resolve()
 
     def test_invalid_repo_raises(self):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(ValueError, match="Not a git repository"):
                 GitFilterRepoAdapter(tmpdir)
 
     def test_get_commits(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         commits = adapter.get_commits()
@@ -120,7 +67,6 @@ class TestGitFilterRepoAdapter:
         assert commits[2].message == "Initial commit"
 
     def test_get_commits_with_limit(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         commits = adapter.get_commits(max_count=2)
@@ -128,7 +74,6 @@ class TestGitFilterRepoAdapter:
         assert len(commits) == 2
 
     def test_get_commit_files(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         commits = adapter.get_commits()
@@ -138,7 +83,6 @@ class TestGitFilterRepoAdapter:
         assert "config.json" in files
 
     def test_analyze_history(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         analysis = adapter.analyze_history()
@@ -148,7 +92,6 @@ class TestGitFilterRepoAdapter:
         assert analysis["authors"]["Test User <test@example.com>"] == 3
 
     def test_create_backup(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         backup_branch = adapter.create_backup()
@@ -165,7 +108,6 @@ class TestGitFilterRepoAdapter:
         assert backup_branch in result.stdout
 
     def test_list_all_files_in_history(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         files = adapter.list_all_files_in_history()
@@ -175,7 +117,6 @@ class TestGitFilterRepoAdapter:
         assert "config.json" in files
 
     def test_get_file_history(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         history = adapter.get_file_history("README.md")
@@ -184,10 +125,9 @@ class TestGitFilterRepoAdapter:
         assert history[0]["message"] == "Initial commit"
 
 
-@_requires_git_filter_repo
+@requires_git_filter_repo
 class TestDryRunOperations:
     def test_rewrite_messages_dry_run(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
@@ -205,7 +145,6 @@ class TestDryRunOperations:
         assert not commits[0].message.startswith("[REWRITTEN]")
 
     def test_change_author_dry_run(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
@@ -225,7 +164,6 @@ class TestDryRunOperations:
         assert commits[0].author_email == "test@example.com"
 
     def test_squash_commits_dry_run(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
@@ -243,7 +181,6 @@ class TestDryRunOperations:
         assert len(commits_after) == 3
 
     def test_change_commit_dates_dry_run(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
@@ -258,7 +195,6 @@ class TestDryRunOperations:
         assert "Preview:" in result.message
 
     def test_change_commit_dates_custom_range_dry_run(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
@@ -271,7 +207,6 @@ class TestDryRunOperations:
         assert result.dry_run is True
 
     def test_change_commit_dates_weekend_only_dry_run(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
@@ -285,7 +220,6 @@ class TestDryRunOperations:
         assert result.dry_run is True
 
     def test_change_commit_dates_invalid_range(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
@@ -298,7 +232,6 @@ class TestDryRunOperations:
         assert "Unknown time range" in result.message
 
     def test_filter_paths_include_exclude_rejected(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
@@ -312,7 +245,6 @@ class TestDryRunOperations:
         assert "Cannot use include_paths and exclude_paths together" in result.message
 
     def test_replace_text_dry_run_searches_history(self, temp_git_repo):
-        from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
 
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
 
