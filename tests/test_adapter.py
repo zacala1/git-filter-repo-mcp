@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
+from git_filter_repo_mcp.adapter import FilterResult, GitFilterRepoAdapter
+
 
 class TestPathNormalization:
     def test_linux_absolute_path_preserved_on_windows(self):
@@ -323,3 +325,52 @@ class TestDryRunOperations:
         assert result.success is True
         assert result.dry_run is True
         assert "history" in result.message
+
+
+def _make_mock_adapter():
+    """Create a GitFilterRepoAdapter instance without repo validation."""
+    adapter = object.__new__(GitFilterRepoAdapter)
+    adapter.repo_path = Path("/fake/repo")
+    return adapter
+
+
+class TestChangeDateHelpers:
+    """Test private helpers extracted from change_commit_dates."""
+
+    def test_parse_time_range_preset_evening(self):
+        adapter = _make_mock_adapter()
+        assert adapter._parse_time_range("evening") == (19, 0, 23, 0)
+
+    def test_parse_time_range_preset_night(self):
+        adapter = _make_mock_adapter()
+        assert adapter._parse_time_range("night") == (22, 0, 2, 0)
+
+    def test_parse_time_range_preset_weekend(self):
+        adapter = _make_mock_adapter()
+        assert adapter._parse_time_range("weekend") == (10, 0, 22, 0)
+
+    def test_parse_time_range_preset_random(self):
+        adapter = _make_mock_adapter()
+        assert adapter._parse_time_range("random") == (0, 0, 23, 59)
+
+    def test_parse_time_range_custom_valid(self):
+        adapter = _make_mock_adapter()
+        assert adapter._parse_time_range("18:30-22:00") == (18, 30, 22, 0)
+
+    def test_parse_time_range_custom_hours_only(self):
+        adapter = _make_mock_adapter()
+        assert adapter._parse_time_range("9-17") == (9, 0, 17, 0)
+
+    def test_parse_time_range_invalid_format(self):
+        adapter = _make_mock_adapter()
+        result = adapter._parse_time_range("abc-def")
+        assert isinstance(result, FilterResult)
+        assert result.success is False
+        assert "Invalid time range" in result.message
+
+    def test_parse_time_range_unknown_preset(self):
+        adapter = _make_mock_adapter()
+        result = adapter._parse_time_range("invalid")
+        assert isinstance(result, FilterResult)
+        assert result.success is False
+        assert "Unknown time range" in result.message

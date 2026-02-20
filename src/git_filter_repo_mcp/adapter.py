@@ -706,71 +706,55 @@ if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
         finally:
             Path(expressions_path).unlink(missing_ok=True)
 
-    def change_commit_dates(
-        self,
-        time_range: str = "evening",
-        weekend_only: bool = False,
-        preserve_order: bool = True,
-        start_date: str | None = None,
-        dry_run: bool = True,
-        force: bool = False,
-    ) -> FilterResult:
-        """
-        Change commit dates to specified time range.
+    _TIME_RANGE_PRESETS = {
+        "evening": (19, 0, 23, 0),
+        "night": (22, 0, 2, 0),
+        "weekend": (10, 0, 22, 0),
+        "random": (0, 0, 23, 59),
+    }
 
-        Args:
-            time_range: Preset ('evening', 'night', 'weekend', 'random') or custom 'HH:MM-HH:MM'
-            weekend_only: If True, move all commits to weekends
-            preserve_order: If True, maintain relative commit order
-            start_date: Start date for commits (YYYY-MM-DD)
-            dry_run: If True, only show what would be changed
-            force: If True, allow running on repo with existing filter-repo state
-        """
-        import random
+    def _parse_time_range(self, time_range: str) -> tuple[int, int, int, int] | FilterResult:
+        """Parse a time range string into (start_hour, start_min, end_hour, end_min)."""
+        if time_range in self._TIME_RANGE_PRESETS:
+            return self._TIME_RANGE_PRESETS[time_range]
 
-        commits = self.get_commits()
-        if not commits:
-            return FilterResult(
-                success=True,
-                message="No commits to modify",
-                commits_processed=0,
-            )
-
-        # Parse time range
-        time_ranges = {
-            "evening": (19, 0, 23, 0),  # 19:00-23:00
-            "night": (22, 0, 2, 0),  # 22:00-02:00
-            "weekend": (10, 0, 22, 0),  # 10:00-22:00
-            "random": (0, 0, 23, 59),  # any time
-        }
-
-        if time_range in time_ranges:
-            start_hour, start_min, end_hour, end_min = time_ranges[time_range]
-        elif "-" in time_range:
-            # Custom format: "HH:MM-HH:MM"
+        if "-" in time_range:
             try:
                 start_str, end_str = time_range.split("-")
                 start_parts = start_str.strip().split(":")
                 end_parts = end_str.strip().split(":")
-                start_hour, start_min = int(start_parts[0]), int(start_parts[1]) if len(start_parts) > 1 else 0
-                end_hour, end_min = int(end_parts[0]), int(end_parts[1]) if len(end_parts) > 1 else 0
+                start_hour = int(start_parts[0])
+                start_min = int(start_parts[1]) if len(start_parts) > 1 else 0
+                end_hour = int(end_parts[0])
+                end_min = int(end_parts[1]) if len(end_parts) > 1 else 0
+                return (start_hour, start_min, end_hour, end_min)
             except (ValueError, IndexError):
                 return FilterResult(
                     success=False,
                     message=f"Invalid time range format: {time_range}",
                     error="Use preset (evening, night, weekend, random) or custom format 'HH:MM-HH:MM'",
                 )
-        else:
-            return FilterResult(
-                success=False,
-                message=f"Unknown time range: {time_range}",
-                error="Use preset (evening, night, weekend, random) or custom format 'HH:MM-HH:MM'",
-            )
 
-        # Generate new dates
-        date_mappings = {}  # commit_hash -> (new_timestamp, tz_offset_str)
+        return FilterResult(
+            success=False,
+            message=f"Unknown time range: {time_range}",
+            error="Use preset (evening, night, weekend, random) or custom format 'HH:MM-HH:MM'",
+        )
 
-        # Parse original dates and sort by date (oldest first)
+    def _generate_date_mappings(
+        self,
+        commits: list[CommitInfo],
+        start_hour: int,
+        start_min: int,
+        end_hour: int,
+        end_min: int,
+        weekend_only: bool,
+        preserve_order: bool,
+        start_date: str | None,
+    ) -> dict[str, tuple[int, str]] | FilterResult:
+        """Generate new date mappings for commits within the specified time constraints."""
+        import random
+
         commit_dates = []
         for commit in commits:
             try:
@@ -779,9 +763,8 @@ if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
             except ValueError:
                 continue
 
-        commit_dates.sort(key=lambda x: x[1])  # Sort by date, oldest first
+        commit_dates.sort(key=lambda x: x[1])
 
-        # Determine base date
         if start_date:
             try:
                 base_date = datetime.datetime.strptime(start_date, "%Y-%m-%d")
@@ -794,18 +777,15 @@ if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
         else:
             base_date = commit_dates[0][1] if commit_dates else datetime.datetime.now()
 
-        # Generate new timestamps
+        date_mappings: dict[str, tuple[int, str]] = {}
         current_date = base_date
         prev_timestamp = None
 
         for commit_hash, orig_dt in commit_dates:
-            # Preserve original timezone offset
             tz_offset = orig_dt.strftime("%z") or "+0000"
 
-            # Find next valid datetime
             found_valid = False
-            for _ in range(100):  # Max attempts to find valid date
-                # Generate random time within range
+            for _ in range(100):
                 if end_hour >= start_hour:
                     hour = random.randint(start_hour, end_hour)
                     if hour == end_hour:
@@ -815,7 +795,6 @@ if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
                     else:
                         minute = random.randint(0, 59)
                 else:
-                    # Crosses midnight (e.g., 22:00-02:00)
                     if random.random() < 0.5:
                         hour = random.randint(start_hour, 23)
                     else:
@@ -823,22 +802,17 @@ if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
                     minute = random.randint(0, 59)
 
                 second = random.randint(0, 59)
-
                 new_dt = current_date.replace(hour=hour, minute=minute, second=second, microsecond=0)
 
-                # Check weekend constraint
-                if weekend_only and new_dt.weekday() < 5:  # 0-4 are weekdays
-                    # Move to next weekend
+                if weekend_only and new_dt.weekday() < 5:
                     days_until_saturday = (5 - new_dt.weekday()) % 7
                     if days_until_saturday == 0:
                         days_until_saturday = 7
                     current_date = current_date + datetime.timedelta(days=days_until_saturday)
                     continue
 
-                # Ensure ordering
                 if preserve_order and prev_timestamp:
                     if new_dt <= prev_timestamp:
-                        # Add some time
                         new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 60))
                         current_date = new_dt
 
@@ -846,46 +820,25 @@ if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
                 break
 
             if not found_valid:
-                # Fallback: use prev_timestamp + offset to maintain ordering
                 if prev_timestamp:
                     new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 30))
-                # else: new_dt from last loop iteration is used
 
             date_mappings[commit_hash] = (int(new_dt.timestamp()), tz_offset)
             prev_timestamp = new_dt
 
-            # Occasionally move to next day for variety
             if random.random() < 0.3:
                 current_date = current_date + datetime.timedelta(days=1)
 
-        if dry_run:
-            preview = []
-            for commit_hash, (new_ts, tz) in list(date_mappings.items())[:10]:
-                orig_commit = next((c for c in commits if c.hash == commit_hash), None)
-                if orig_commit:
-                    new_dt = datetime.datetime.fromtimestamp(new_ts)
-                    preview.append(
-                        f"{commit_hash[:8]}: {orig_commit.date[:19]} -> {new_dt.isoformat()[:19]}"
-                    )
+        return date_mappings
 
-            return FilterResult(
-                success=True,
-                message=f"Dry run: {len(date_mappings)} commits would have dates changed\n\nPreview:\n" + "\n".join(preview),
-                commits_processed=len(commits),
-                commits_rewritten=len(date_mappings),
-                dry_run=True,
-            )
-
-        # Create commit callback script
-        # Serialize as {hash: [timestamp, tz_offset]} for the callback
-        serializable_mappings = {h: [ts, tz] for h, (ts, tz) in date_mappings.items()}
-        encoded_mappings = base64.b64encode(json.dumps(serializable_mappings).encode()).decode()
+    def _create_date_callback_script(self, date_mappings: dict[str, tuple[int, str]]) -> str:
+        """Create a temporary callback script for date rewriting. Caller must delete."""
+        serializable = {h: [ts, tz] for h, (ts, tz) in date_mappings.items()}
+        encoded = base64.b64encode(json.dumps(serializable).encode()).decode()
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            # git-filter-repo exec's this with `commit` object in scope;
-            # we modify commit properties directly (no reassignment needed).
             f.write(f'''import base64, json
-_DATA = "{encoded_mappings}"
+_DATA = "{encoded}"
 _DATE_MAP = json.loads(base64.b64decode(_DATA).decode())
 _commit_hash = commit.original_id.decode() if commit.original_id else None
 if _commit_hash and _commit_hash in _DATE_MAP:
@@ -894,28 +847,73 @@ if _commit_hash and _commit_hash in _DATE_MAP:
     commit.author_date = _new_date
     commit.committer_date = _new_date
 ''')
-            script_path = f.name
+            return f.name
 
-        try:
-            result = self._run_filter_repo(
-                "--commit-callback",
-                f"filename:{script_path}",
-                dry_run=False,
-                force=force,
-            )
+    def change_commit_dates(
+        self,
+        time_range: str = "evening",
+        weekend_only: bool = False,
+        preserve_order: bool = True,
+        start_date: str | None = None,
+        dry_run: bool = True,
+        force: bool = False,
+    ) -> FilterResult:
+        """Change commit dates to specified time range.
 
-            if result.returncode != 0:
-                return FilterResult(
-                    success=False,
-                    message="Failed to change commit dates",
-                    error=result.stderr,
-                )
+        Args:
+            time_range: Preset ('evening', 'night', 'weekend', 'random') or custom 'HH:MM-HH:MM'
+            weekend_only: If True, move all commits to weekends
+            preserve_order: If True, maintain relative commit order
+            start_date: Start date for commits (YYYY-MM-DD)
+            dry_run: If True, only show what would be changed
+            force: If True, allow running on repo with existing filter-repo state
+        """
+        commits = self.get_commits()
+        if not commits:
+            return FilterResult(success=True, message="No commits to modify", commits_processed=0)
 
+        parsed = self._parse_time_range(time_range)
+        if isinstance(parsed, FilterResult):
+            return parsed
+        start_hour, start_min, end_hour, end_min = parsed
+
+        mappings = self._generate_date_mappings(
+            commits, start_hour, start_min, end_hour, end_min,
+            weekend_only, preserve_order, start_date,
+        )
+        if isinstance(mappings, FilterResult):
+            return mappings
+
+        if dry_run:
+            preview = []
+            for commit_hash, (new_ts, tz) in list(mappings.items())[:10]:
+                orig_commit = next((c for c in commits if c.hash == commit_hash), None)
+                if orig_commit:
+                    new_dt = datetime.datetime.fromtimestamp(new_ts)
+                    preview.append(
+                        f"{commit_hash[:8]}: {orig_commit.date[:19]} -> {new_dt.isoformat()[:19]}"
+                    )
             return FilterResult(
                 success=True,
-                message=f"Successfully changed dates for {len(date_mappings)} commits",
+                message=f"Dry run: {len(mappings)} commits would have dates changed\n\nPreview:\n" + "\n".join(preview),
                 commits_processed=len(commits),
-                commits_rewritten=len(date_mappings),
+                commits_rewritten=len(mappings),
+                dry_run=True,
+            )
+
+        script_path = self._create_date_callback_script(mappings)
+        try:
+            result = self._run_filter_repo(
+                "--commit-callback", f"filename:{script_path}",
+                dry_run=False, force=force,
+            )
+            if result.returncode != 0:
+                return FilterResult(success=False, message="Failed to change commit dates", error=result.stderr)
+            return FilterResult(
+                success=True,
+                message=f"Successfully changed dates for {len(mappings)} commits",
+                commits_processed=len(commits),
+                commits_rewritten=len(mappings),
             )
         finally:
             Path(script_path).unlink(missing_ok=True)
