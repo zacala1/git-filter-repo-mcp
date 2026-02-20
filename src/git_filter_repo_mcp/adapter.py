@@ -494,30 +494,15 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
                 error=str(e),
             )
 
-    def scan_secrets(
-        self,
-        branch: str = "HEAD",
-        max_commits: int = 100,
-    ) -> dict:
-        """Scan repository history for potential secrets."""
-        from .secrets import get_file_risk_level, is_sensitive_file, scan_content
-
-        commits = self.get_commits(branch, max_commits)
-        findings = []
-        sensitive_files = []
-
-        # Get all files for all commits in a single git command (optimized)
+    def _collect_commit_files(
+        self, commits: list[CommitInfo], branch: str, max_commits: int,
+    ) -> dict[str, list[str]]:
+        """Collect file lists for commits, bulk-fetched with per-commit fallback."""
         try:
             result = self._run_git(
-                "log",
-                "--name-only",
-                "--format=%H",
-                f"-n{max_commits}",
-                branch,
+                "log", "--name-only", "--format=%H", f"-n{max_commits}", branch,
             )
-
-            # Parse: commit hash followed by files
-            commit_files_map = {}
+            commit_files_map: dict[str, list[str]] = {}
             current_hash = None
             for line in _parse_lines(result.stdout):
                 if len(line) == 40 and all(c in "0123456789abcdef" for c in line):
@@ -525,21 +510,17 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
                     commit_files_map[current_hash] = []
                 elif current_hash:
                     commit_files_map[current_hash].append(line)
+            return commit_files_map
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            commit_files_map = {c.hash: self.get_commit_files(c.hash) for c in commits[:20]}
+            return {c.hash: self.get_commit_files(c.hash) for c in commits[:20]}
 
-        # Collect files to scan
-        files_to_scan = []
-        for commit in commits:
-            for file_path in commit_files_map.get(commit.hash, []):
-                if is_sensitive_file(file_path):
-                    sensitive_files.append({
-                        "file": file_path, "commit": commit.hash[:8], "risk": get_file_risk_level(file_path),
-                    })
-                if len(files_to_scan) < MAX_FILES_TO_SCAN:
-                    files_to_scan.append((commit.hash, file_path))
+    def _scan_file_contents(
+        self, files_to_scan: list[tuple[str, str]],
+    ) -> list[dict]:
+        """Scan file contents for secrets, returning finding dicts."""
+        from .secrets import scan_content
 
-        # Scan contents
+        findings: list[dict] = []
         for commit_hash, file_path in files_to_scan:
             if len(findings) >= MAX_FINDINGS_LIMIT:
                 break
@@ -554,6 +535,31 @@ message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
                     })
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 continue
+        return findings
+
+    def scan_secrets(
+        self,
+        branch: str = "HEAD",
+        max_commits: int = 100,
+    ) -> dict:
+        """Scan repository history for potential secrets."""
+        from .secrets import get_file_risk_level, is_sensitive_file
+
+        commits = self.get_commits(branch, max_commits)
+        commit_files_map = self._collect_commit_files(commits, branch, max_commits)
+
+        sensitive_files = []
+        files_to_scan: list[tuple[str, str]] = []
+        for commit in commits:
+            for file_path in commit_files_map.get(commit.hash, []):
+                if is_sensitive_file(file_path):
+                    sensitive_files.append({
+                        "file": file_path, "commit": commit.hash[:8], "risk": get_file_risk_level(file_path),
+                    })
+                if len(files_to_scan) < MAX_FILES_TO_SCAN:
+                    files_to_scan.append((commit.hash, file_path))
+
+        findings = self._scan_file_contents(files_to_scan)
 
         return {
             "commits_scanned": len(commits), "secrets_found": len(findings),
