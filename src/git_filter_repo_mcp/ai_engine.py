@@ -1,5 +1,6 @@
 """AI-powered commit message engine using Ollama, OpenAI, or Anthropic."""
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -382,13 +383,21 @@ class AICommitEngine:
     async def rewrite_batch(
         self,
         commits: list[tuple[str, str, list[str]]],
+        max_concurrency: int = 5,
     ) -> list[RewriteResult]:
-        """Batch rewrite."""
-        results = []
-        for commit_hash, message, files in commits:
-            result = await self.rewrite_message(message, commit_hash, files)
-            results.append(result)
-        return results
+        """Batch rewrite with bounded concurrency."""
+        if not commits:
+            return []
+
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def _limited(commit_hash: str, message: str, files: list[str]) -> RewriteResult:
+            async with semaphore:
+                return await self.rewrite_message(message, commit_hash, files)
+
+        return list(await asyncio.gather(
+            *(_limited(h, m, f) for h, m, f in commits)
+        ))
 
     async def close(self):
         if hasattr(self.provider, "close"):

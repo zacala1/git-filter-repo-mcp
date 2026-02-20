@@ -1,5 +1,7 @@
 """AI engine tests."""
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from git_filter_repo_mcp.ai_engine import (
@@ -10,6 +12,7 @@ from git_filter_repo_mcp.ai_engine import (
     MessageStyle,
     OllamaProvider,
     OpenAIProvider,
+    RewriteResult,
     build_prompt,
     get_provider,
 )
@@ -232,3 +235,59 @@ class TestProviderLastError:
     def test_anthropic_last_error_initially_none(self):
         provider = AnthropicProvider(api_key="test")
         assert provider._last_error is None
+
+
+class TestRewriteBatch:
+    """Test AICommitEngine.rewrite_batch with asyncio.gather."""
+
+    @pytest.mark.asyncio
+    async def test_batch_empty_list(self):
+        engine = AICommitEngine()
+        results = await engine.rewrite_batch([])
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_batch_calls_all_commits(self):
+        engine = AICommitEngine()
+        engine.rewrite_message = AsyncMock(
+            side_effect=lambda msg, h, files: RewriteResult(
+                original=msg, rewritten=f"rewritten: {msg}", commit_hash=h,
+            )
+        )
+        commits = [
+            ("hash1", "msg1", ["a.py"]),
+            ("hash2", "msg2", ["b.py"]),
+            ("hash3", "msg3", ["c.py"]),
+        ]
+        results = await engine.rewrite_batch(commits)
+        assert len(results) == 3
+        assert results[0].rewritten == "rewritten: msg1"
+        assert results[2].commit_hash == "hash3"
+        assert engine.rewrite_message.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_batch_respects_concurrency_limit(self):
+        """Verify semaphore limits concurrent execution."""
+        import asyncio
+
+        max_concurrent = 0
+        current_concurrent = 0
+        lock = asyncio.Lock()
+
+        async def _tracked_rewrite(msg, h, files):
+            nonlocal max_concurrent, current_concurrent
+            async with lock:
+                current_concurrent += 1
+                if current_concurrent > max_concurrent:
+                    max_concurrent = current_concurrent
+            await asyncio.sleep(0.01)
+            async with lock:
+                current_concurrent -= 1
+            return RewriteResult(original=msg, rewritten=msg, commit_hash=h)
+
+        engine = AICommitEngine()
+        engine.rewrite_message = _tracked_rewrite
+        commits = [(f"h{i}", f"m{i}", []) for i in range(10)]
+        results = await engine.rewrite_batch(commits, max_concurrency=3)
+        assert len(results) == 10
+        assert max_concurrent <= 3
