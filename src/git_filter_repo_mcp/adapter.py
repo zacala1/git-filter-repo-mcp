@@ -236,43 +236,37 @@ class GitFilterRepoAdapter:
         replacements = {old: new for _, old, new in rewrites}
         encoded_replacements = base64.b64encode(json.dumps(replacements).encode()).decode()
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            # Write self-contained script with embedded data
-            # git-filter-repo exec's this with `message` (bytes) in scope;
-            # we must reassign `message` for changes to take effect.
-            f.write(f'''import base64, json
-_DATA = "{encoded_replacements}"
-_REPLACEMENTS = json.loads(base64.b64decode(_DATA).decode())
-_msg_str = message.decode('utf-8') if isinstance(message, bytes) else message
-_new_msg = _REPLACEMENTS.get(_msg_str.strip(), _msg_str)
-message = _new_msg.encode('utf-8') if isinstance(message, bytes) else _new_msg
-''')
-            script_path = f.name
+        # Build inline callback script with base64-encoded data
+        # git-filter-repo exec's this with `message` (bytes) in scope
+        callback_code = (
+            f'import base64, json\n'
+            f'_DATA = "{encoded_replacements}"\n'
+            f'_REPLACEMENTS = json.loads(base64.b64decode(_DATA).decode())\n'
+            f'_msg_str = message.decode("utf-8") if isinstance(message, bytes) else message\n'
+            f'_new_msg = _REPLACEMENTS.get(_msg_str.strip(), _msg_str)\n'
+            f'return _new_msg.encode("utf-8") if isinstance(message, bytes) else _new_msg'
+        )
 
-        try:
-            # Use --message-callback with file: prefix (safer than exec)
-            result = self._run_filter_repo(
-                "--message-callback",
-                f"filename:{script_path}",
-                dry_run=False,
-                force=force,
-            )
+        result = self._run_filter_repo(
+            "--message-callback",
+            callback_code,
+            dry_run=False,
+            force=force,
+        )
 
-            if result.returncode != 0:
-                return FilterResult(
-                    success=False,
-                    message="Failed to rewrite commit messages",
-                    error=result.stderr,
-                )
-
+        if result.returncode != 0:
             return FilterResult(
-                success=True,
-                message=f"Successfully rewrote {len(rewrites)} commit messages",
-                commits_processed=len(commits),
-                commits_rewritten=len(rewrites),
+                success=False,
+                message="Failed to rewrite commit messages",
+                error=result.stderr,
             )
-        finally:
-            Path(script_path).unlink(missing_ok=True)
+
+        return FilterResult(
+            success=True,
+            message=f"Successfully rewrote {len(rewrites)} commit messages",
+            commits_processed=len(commits),
+            commits_rewritten=len(rewrites),
+        )
 
     def change_author(
         self,

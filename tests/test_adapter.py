@@ -306,3 +306,103 @@ class TestChangeDateHelpers:
         assert isinstance(result, FilterResult)
         assert result.success is False
         assert "Unknown time range" in result.message
+
+
+@requires_git_filter_repo
+class TestRealExecution:
+    """Test non-dry-run adapter operations (requires git-filter-repo)."""
+
+    def test_remove_files_actually_removes(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        # config.json should exist in history
+        files_before = adapter.list_all_files_in_history()
+        assert "config.json" in files_before
+
+        result = adapter.remove_files(["config.json"], dry_run=False, force=True)
+        assert result.success is True
+        assert result.dry_run is False
+
+        # Re-create adapter to pick up new history
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        files_after = adapter2.list_all_files_in_history()
+        assert "config.json" not in files_after
+
+    def test_change_author_actually_changes(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        result = adapter.change_author(
+            old_email="test@example.com",
+            new_name="Changed User",
+            new_email="changed@example.com",
+            dry_run=False,
+            force=True,
+        )
+        assert result.success is True
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter2.get_commits()
+        for c in commits:
+            assert c.author_email == "changed@example.com"
+            assert c.author_name == "Changed User"
+
+    def test_rewrite_messages_actually_changes(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        def callback(msg, _hash):
+            return f"[PREFIXED] {msg}"
+
+        result = adapter.rewrite_commit_messages(callback, dry_run=False, force=True)
+        assert result.success is True
+        assert result.commits_rewritten == 3
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter2.get_commits()
+        for c in commits:
+            assert c.message.startswith("[PREFIXED]")
+
+    def test_replace_text_actually_replaces(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+
+        result = adapter.replace_text_in_history(
+            old_text="hello", new_text="world", dry_run=False, force=True,
+        )
+        assert result.success is True
+
+        # Verify text is replaced in working tree
+        content = (temp_git_repo / "main.py").read_text()
+        assert "world" in content
+        assert "hello" not in content
+
+    def test_restore_backup_works(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        backup_branch = adapter.create_backup()
+        commits_before = adapter.get_commits()
+
+        # Make a non-filter-repo change (add a new commit)
+        (temp_git_repo / "extra.txt").write_text("extra")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "extra"], cwd=temp_git_repo, capture_output=True)
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        assert len(adapter2.get_commits()) == 4  # 3 original + 1 extra
+
+        # Restore to backup (which is at 3 commits)
+        result = adapter2.restore_backup(backup_branch)
+        assert result.success is True
+
+        adapter3 = GitFilterRepoAdapter(str(temp_git_repo))
+        commits_after = adapter3.get_commits()
+        assert len(commits_after) == 3
+        assert commits_after[0].hash == commits_before[0].hash
+
+    def test_scan_secrets_with_real_secret(self, temp_git_repo):
+        # Write a fake secret and commit it
+        (temp_git_repo / "secret.env").write_text("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add secret"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        scan_result = adapter.scan_secrets()
+        # scan_secrets returns "secrets_found" and "sensitive_files" keys
+        assert scan_result["secrets_found"] > 0 or scan_result["sensitive_files"] > 0

@@ -630,3 +630,157 @@ class TestFilterPaths:
 
             assert result["success"] is True
             assert result["dry_run"] is True
+
+
+class TestRemoveLargeFilesHandler:
+    """Test remove_large_files handler."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.remove_large_files.return_value = FilterResult(
+                success=True,
+                message="Found 2 files larger than 10.0 MB",
+                commits_processed=5,
+                commits_rewritten=0,
+                files_affected=["big.bin", "huge.zip"],
+                dry_run=True,
+                error=None,
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "remove_large_files",
+                {"repo_path": "/tmp/repo", "size_threshold_mb": 10.0, "dry_run": True},
+            )
+
+            assert result["success"] is True
+            assert result["dry_run"] is True
+            assert result["files_affected"] == ["big.bin", "huge.zip"]
+            mock_adapter.remove_large_files.assert_called_once_with(10.0, True, False)
+
+
+class TestSquashCommitsHandler:
+    """Test squash_commits handler."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.squash_commits.return_value = FilterResult(
+                success=True,
+                message="Would squash 3 commits",
+                commits_processed=3,
+                commits_rewritten=0,
+                files_affected=[],
+                dry_run=True,
+                error=None,
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "squash_commits",
+                {
+                    "repo_path": "/tmp/repo",
+                    "start_commit": "abc123",
+                    "end_commit": "HEAD",
+                    "dry_run": True,
+                },
+            )
+
+            assert result["success"] is True
+            assert result["dry_run"] is True
+            assert result["commits_processed"] == 3
+
+    @pytest.mark.asyncio
+    async def test_with_auto_backup(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
+             patch("git_filter_repo_mcp.server.config") as mock_config:
+            mock_config.server.auto_backup = True
+            mock_adapter = MagicMock()
+            mock_adapter.create_backup.return_value = "backup_squash"
+            mock_adapter.squash_commits.return_value = FilterResult(
+                success=True,
+                message="Squashed 3 commits",
+                commits_processed=3,
+                commits_rewritten=1,
+                files_affected=[],
+                dry_run=False,
+                error=None,
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "squash_commits",
+                {
+                    "repo_path": "/tmp/repo",
+                    "start_commit": "abc123",
+                    "dry_run": False,
+                },
+            )
+
+            assert result["success"] is True
+            assert result["backup_branch"] == "backup_squash"
+
+
+class TestChangeDatesHandler:
+    """Test change_commit_dates handler."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.change_commit_dates.return_value = FilterResult(
+                success=True,
+                message="Preview: 5 commits would be changed",
+                commits_processed=5,
+                commits_rewritten=5,
+                files_affected=[],
+                dry_run=True,
+                error=None,
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "change_commit_dates",
+                {
+                    "repo_path": "/tmp/repo",
+                    "time_range": "evening",
+                    "dry_run": True,
+                },
+            )
+
+            assert result["success"] is True
+            assert result["dry_run"] is True
+            assert result["commits_rewritten"] == 5
+
+    @pytest.mark.asyncio
+    async def test_weekend_only(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.change_commit_dates.return_value = FilterResult(
+                success=True,
+                message="Preview: weekend dates",
+                commits_processed=3,
+                commits_rewritten=3,
+                files_affected=[],
+                dry_run=True,
+                error=None,
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "change_commit_dates",
+                {
+                    "repo_path": "/tmp/repo",
+                    "time_range": "random",
+                    "weekend_only": True,
+                    "dry_run": True,
+                },
+            )
+
+            assert result["success"] is True
+            mock_adapter.change_commit_dates.assert_called_once_with(
+                "random", True, True, None, dry_run=True, force=False,
+            )
