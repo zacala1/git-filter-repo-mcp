@@ -122,7 +122,8 @@ class GitFilterRepoAdapter:
         """Run a command in the repo directory."""
         try:
             return subprocess.run(
-                args, cwd=self.repo_path, capture_output=True, text=True, check=check, timeout=timeout
+                args, cwd=self.repo_path, capture_output=True, text=True,
+                check=check, timeout=timeout, encoding="utf-8", errors="replace",
             )
         except subprocess.TimeoutExpired:
             logger.error(f"timeout {timeout}s: {args[0]}")
@@ -156,7 +157,11 @@ class GitFilterRepoAdapter:
         if max_count:
             args.append(f"-n{max_count}")
 
-        result = self._run_git(*args)
+        try:
+            result = self._run_git(*args)
+        except subprocess.CalledProcessError:
+            # Empty repo or invalid branch — no commits
+            return []
         commits = []
         for line in _parse_lines(result.stdout):
             parts = line.split(sep, 6)

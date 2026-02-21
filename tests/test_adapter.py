@@ -406,3 +406,59 @@ class TestRealExecution:
         scan_result = adapter.scan_secrets()
         # scan_secrets returns "secrets_found" and "sensitive_files" keys
         assert scan_result["secrets_found"] > 0 or scan_result["sensitive_files"] > 0
+
+
+@requires_git_filter_repo
+class TestEdgeCases:
+    """Test edge cases with various repo states."""
+
+    def test_empty_repo_get_commits(self, empty_git_repo):
+        adapter = GitFilterRepoAdapter(str(empty_git_repo))
+        commits = adapter.get_commits()
+        assert commits == []
+
+    def test_empty_repo_analyze_history(self, empty_git_repo):
+        adapter = GitFilterRepoAdapter(str(empty_git_repo))
+        analysis = adapter.analyze_history()
+        assert analysis["total_commits"] == 0
+        assert analysis["authors"] == {}
+
+    def test_single_commit_squash_noop(self, single_commit_repo):
+        adapter = GitFilterRepoAdapter(str(single_commit_repo))
+        commits = adapter.get_commits()
+        # Squashing from the only commit should produce no range
+        result = adapter.squash_commits(start_commit=commits[0].hash, dry_run=True)
+        assert result.commits_processed == 0
+
+    def test_single_commit_change_dates(self, single_commit_repo):
+        adapter = GitFilterRepoAdapter(str(single_commit_repo))
+        result = adapter.change_commit_dates(time_range="evening", dry_run=True)
+        assert result.success is True
+        assert result.commits_rewritten == 1
+
+    def test_unicode_commit_message_preserved(self, unicode_git_repo):
+        adapter = GitFilterRepoAdapter(str(unicode_git_repo))
+        commits = adapter.get_commits()
+        assert len(commits) == 1
+        assert "\u2728" in commits[0].message
+
+    def test_unicode_rewrite_dry_run(self, unicode_git_repo):
+        adapter = GitFilterRepoAdapter(str(unicode_git_repo))
+
+        def callback(msg, _hash):
+            return f"[prefix] {msg}"
+
+        result = adapter.rewrite_commit_messages(callback, dry_run=True)
+        assert result.success is True
+        assert result.commits_rewritten == 1
+
+    def test_nonexistent_file_get_history(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        history = adapter.get_file_history("nonexistent.txt")
+        assert history == []
+
+    def test_remove_nonexistent_file_dry_run(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.remove_files(["nonexistent.txt"], dry_run=True)
+        assert result.success is True
+        assert result.commits_rewritten == 0
