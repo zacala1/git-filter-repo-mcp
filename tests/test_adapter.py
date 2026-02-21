@@ -462,3 +462,17 @@ class TestEdgeCases:
         result = adapter.remove_files(["nonexistent.txt"], dry_run=True)
         assert result.success is True
         assert result.commits_rewritten == 0
+
+
+class TestPathValidation:
+    """Test path validation in _validate_repo."""
+
+    def test_relative_path_rejected(self):
+        with pytest.raises(ValueError, match="must be absolute"):
+            GitFilterRepoAdapter("relative/path/repo")
+
+    def test_nonexistent_path_rejected(self):
+        import platform
+        path = "C:\\nonexistent\\path\\to\\repo" if platform.system() == "Windows" else "/nonexistent/path/to/repo"
+        with pytest.raises(ValueError, match="does not exist"):
+            GitFilterRepoAdapter(path)

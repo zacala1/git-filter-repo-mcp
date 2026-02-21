@@ -71,7 +71,10 @@ class GitFilterRepoAdapter:
     """Adapter for git-filter-repo commands."""
 
     def __init__(self, repo_path: str):
-        self.repo_path = Path(self._normalize_path(repo_path)).resolve()
+        normalized = Path(self._normalize_path(repo_path))
+        if not normalized.is_absolute():
+            raise ValueError(f"Repository path must be absolute: {repo_path}")
+        self.repo_path = normalized.resolve()
         self._validate_repo()
         self._check_git_filter_repo()
 
@@ -105,6 +108,8 @@ class GitFilterRepoAdapter:
 
     def _validate_repo(self) -> None:
         """Validate that the path is a git repository."""
+        if not self.repo_path.exists():
+            raise ValueError(f"Repository path does not exist: {self.repo_path}")
         git_dir = self.repo_path / ".git"
         if not git_dir.exists():
             raise ValueError(f"Not a git repository: {self.repo_path}")
