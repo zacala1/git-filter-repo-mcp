@@ -307,6 +307,20 @@ class TestChangeDateHelpers:
         assert result.success is False
         assert "Unknown time range" in result.message
 
+    def test_parse_time_range_out_of_bounds_hour(self):
+        adapter = _make_mock_adapter()
+        result = adapter._parse_time_range("25:00-30:00")
+        assert isinstance(result, FilterResult)
+        assert result.success is False
+        assert "out of range" in result.message
+
+    def test_parse_time_range_out_of_bounds_minute(self):
+        adapter = _make_mock_adapter()
+        result = adapter._parse_time_range("10:70-22:00")
+        assert isinstance(result, FilterResult)
+        assert result.success is False
+        assert "out of range" in result.message
+
 
 @requires_git_filter_repo
 class TestRealExecution:

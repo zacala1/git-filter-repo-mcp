@@ -613,11 +613,11 @@ class GitFilterRepoAdapter:
         """Rewrite a single commit's message and/or author in one filter-repo pass."""
         self._validate_commit_hash(commit_hash)
         changes = {}
-        if new_message:
+        if new_message is not None:
             changes["message"] = new_message
-        if new_author_name:
+        if new_author_name is not None:
             changes["author_name"] = new_author_name
-        if new_author_email:
+        if new_author_email is not None:
             changes["author_email"] = new_author_email
 
         if not changes:
@@ -702,7 +702,7 @@ class GitFilterRepoAdapter:
             return FilterResult(success=True, message=f"Dry run: would squash {commit_count} commits", commits_processed=commit_count, dry_run=True)
 
         try:
-            if not new_message:
+            if new_message is None:
                 messages = _parse_lines(self._run_git("log", "--format=%s", f"{start_commit}..{end_commit}").stdout)
                 new_message = "Squashed commits:\n" + "\n".join(f"- {m}" for m in messages) if messages else "Squashed commits"
 
@@ -767,6 +767,13 @@ class GitFilterRepoAdapter:
                 start_min = int(start_parts[1]) if len(start_parts) > 1 else 0
                 end_hour = int(end_parts[0])
                 end_min = int(end_parts[1]) if len(end_parts) > 1 else 0
+                if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23
+                        and 0 <= start_min <= 59 and 0 <= end_min <= 59):
+                    return FilterResult(
+                        success=False,
+                        message=f"Time values out of range: {time_range}",
+                        error="Hours must be 0-23, minutes must be 0-59",
+                    )
                 return (start_hour, start_min, end_hour, end_min)
             except (ValueError, IndexError):
                 return FilterResult(
