@@ -593,55 +593,50 @@ class GitFilterRepoAdapter:
 
         encoded_changes = base64.b64encode(json.dumps(changes).encode()).decode()
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            # git-filter-repo exec's this with `commit` object in scope.
-            # We check original_id to only modify the target commit.
-            f.write(f'''import base64, json
-_DATA = "{encoded_changes}"
-_CHANGES = json.loads(base64.b64decode(_DATA).decode())
-_TARGET = "{commit_hash}"
-_orig_id = commit.original_id.decode() if commit.original_id else None
-if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
-    if "message" in _CHANGES:
-        commit.message = _CHANGES["message"].encode()
-    if "author_name" in _CHANGES:
-        commit.author_name = _CHANGES["author_name"].encode()
-    if "author_email" in _CHANGES:
-        commit.author_email = b"<" + _CHANGES["author_email"].encode() + b">"
-    if "author_name" in _CHANGES:
-        commit.committer_name = _CHANGES["author_name"].encode()
-    if "author_email" in _CHANGES:
-        commit.committer_email = b"<" + _CHANGES["author_email"].encode() + b">"
-''')
-            script_path = f.name
+        # Build inline callback — git-filter-repo exec's this with `commit` in scope
+        callback_code = (
+            f'import base64, json\n'
+            f'_DATA = "{encoded_changes}"\n'
+            f'_CHANGES = json.loads(base64.b64decode(_DATA).decode())\n'
+            f'_TARGET = "{commit_hash}"\n'
+            f'_orig_id = commit.original_id.decode() if commit.original_id else None\n'
+            f'if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):\n'
+            f'    if "message" in _CHANGES:\n'
+            f'        commit.message = _CHANGES["message"].encode()\n'
+            f'    if "author_name" in _CHANGES:\n'
+            f'        commit.author_name = _CHANGES["author_name"].encode()\n'
+            f'    if "author_email" in _CHANGES:\n'
+            f'        commit.author_email = _CHANGES["author_email"].encode()\n'
+            f'    if "author_name" in _CHANGES:\n'
+            f'        commit.committer_name = _CHANGES["author_name"].encode()\n'
+            f'    if "author_email" in _CHANGES:\n'
+            f'        commit.committer_email = _CHANGES["author_email"].encode()'
+        )
 
-        try:
-            result = self._run_filter_repo(
-                "--commit-callback",
-                f"filename:{script_path}",
-                dry_run=False,
-                force=force,
-            )
-            if result.returncode != 0:
-                return FilterResult(
-                    success=False,
-                    message="Failed to rewrite commit",
-                    error=result.stderr,
-                )
-
-            changes_made = []
-            if new_message:
-                changes_made.append("message")
-            if new_author_name or new_author_email:
-                changes_made.append("author")
-
+        result = self._run_filter_repo(
+            "--commit-callback",
+            callback_code,
+            dry_run=False,
+            force=force,
+        )
+        if result.returncode != 0:
             return FilterResult(
-                success=True,
-                message=f"Updated commit {commit_hash[:8]}: {', '.join(changes_made)}",
-                commits_rewritten=1,
+                success=False,
+                message="Failed to rewrite commit",
+                error=result.stderr,
             )
-        finally:
-            Path(script_path).unlink(missing_ok=True)
+
+        changes_made = []
+        if new_message:
+            changes_made.append("message")
+        if new_author_name or new_author_email:
+            changes_made.append("author")
+
+        return FilterResult(
+            success=True,
+            message=f"Updated commit {commit_hash[:8]}: {', '.join(changes_made)}",
+            commits_rewritten=1,
+        )
 
     def list_all_files_in_history(self, limit: int = MAX_FILES_LIMIT) -> list[str]:
         """List all files that have ever existed."""
@@ -841,23 +836,22 @@ if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
 
         return date_mappings
 
-    def _create_date_callback_script(self, date_mappings: dict[str, tuple[int, str]]) -> str:
-        """Create a temporary callback script for date rewriting. Caller must delete."""
+    def _create_date_callback_code(self, date_mappings: dict[str, tuple[int, str]]) -> str:
+        """Build inline callback code for date rewriting."""
         serializable = {h: [ts, tz] for h, (ts, tz) in date_mappings.items()}
         encoded = base64.b64encode(json.dumps(serializable).encode()).decode()
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(f'''import base64, json
-_DATA = "{encoded}"
-_DATE_MAP = json.loads(base64.b64decode(_DATA).decode())
-_commit_hash = commit.original_id.decode() if commit.original_id else None
-if _commit_hash and _commit_hash in _DATE_MAP:
-    _new_ts, _tz_offset = _DATE_MAP[_commit_hash]
-    _new_date = f"{{_new_ts}} {{_tz_offset}}".encode()
-    commit.author_date = _new_date
-    commit.committer_date = _new_date
-''')
-            return f.name
+        return (
+            f'import base64, json\n'
+            f'_DATA = "{encoded}"\n'
+            f'_DATE_MAP = json.loads(base64.b64decode(_DATA).decode())\n'
+            f'_commit_hash = commit.original_id.decode() if commit.original_id else None\n'
+            f'if _commit_hash and _commit_hash in _DATE_MAP:\n'
+            f'    _new_ts, _tz_offset = _DATE_MAP[_commit_hash]\n'
+            f'    _new_date = f"{{_new_ts}} {{_tz_offset}}".encode()\n'
+            f'    commit.author_date = _new_date\n'
+            f'    commit.committer_date = _new_date'
+        )
 
     def change_commit_dates(
         self,
@@ -911,19 +905,16 @@ if _commit_hash and _commit_hash in _DATE_MAP:
                 dry_run=True,
             )
 
-        script_path = self._create_date_callback_script(mappings)
-        try:
-            result = self._run_filter_repo(
-                "--commit-callback", f"filename:{script_path}",
-                dry_run=False, force=force,
-            )
-            if result.returncode != 0:
-                return FilterResult(success=False, message="Failed to change commit dates", error=result.stderr)
-            return FilterResult(
-                success=True,
-                message=f"Successfully changed dates for {len(mappings)} commits",
-                commits_processed=len(commits),
-                commits_rewritten=len(mappings),
-            )
-        finally:
-            Path(script_path).unlink(missing_ok=True)
+        callback_code = self._create_date_callback_code(mappings)
+        result = self._run_filter_repo(
+            "--commit-callback", callback_code,
+            dry_run=False, force=force,
+        )
+        if result.returncode != 0:
+            return FilterResult(success=False, message="Failed to change commit dates", error=result.stderr)
+        return FilterResult(
+            success=True,
+            message=f"Successfully changed dates for {len(mappings)} commits",
+            commits_processed=len(commits),
+            commits_rewritten=len(mappings),
+        )

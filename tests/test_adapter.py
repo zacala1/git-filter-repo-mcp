@@ -396,6 +396,72 @@ class TestRealExecution:
         assert len(commits_after) == 3
         assert commits_after[0].hash == commits_before[0].hash
 
+    def test_rewrite_single_commit_message(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        target = commits[0]  # "Add config"
+
+        result = adapter.rewrite_single_commit(
+            commit_hash=target.hash,
+            new_message="Updated config message",
+            force=True,
+        )
+        assert result.success is True
+        assert result.commits_rewritten == 1
+        assert "message" in result.message
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        new_commits = adapter2.get_commits()
+        assert new_commits[0].message == "Updated config message"
+        # Other commits unchanged
+        assert new_commits[1].message == "Add main.py"
+
+    def test_rewrite_single_commit_author(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        target = commits[1]  # "Add main.py"
+
+        result = adapter.rewrite_single_commit(
+            commit_hash=target.hash,
+            new_author_name="New Author",
+            new_author_email="newauthor@test.com",
+            force=True,
+        )
+        assert result.success is True
+        assert "author" in result.message
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        new_commits = adapter2.get_commits()
+        # Find the commit that was "Add main.py"
+        rewritten = [c for c in new_commits if c.message == "Add main.py"][0]
+        assert rewritten.author_name == "New Author"
+        assert rewritten.author_email == "newauthor@test.com"
+
+    def test_rewrite_single_commit_no_changes(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+
+        result = adapter.rewrite_single_commit(commit_hash=commits[0].hash)
+        assert result.success is False
+        assert "No changes specified" in result.message
+
+    def test_change_commit_dates_actually_changes(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits_before = adapter.get_commits()
+        dates_before = [c.date for c in commits_before]
+
+        result = adapter.change_commit_dates(
+            time_range="night", dry_run=False, force=True,
+        )
+        assert result.success is True
+        assert result.commits_rewritten == 3
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        commits_after = adapter2.get_commits()
+        # Dates should have changed (exact values depend on randomization)
+        dates_after = [c.date for c in commits_after]
+        assert dates_before != dates_after
+
     def test_scan_secrets_with_real_secret(self, temp_git_repo):
         # Write a fake secret and commit it
         (temp_git_repo / "secret.env").write_text("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
@@ -462,6 +528,88 @@ class TestEdgeCases:
         result = adapter.remove_files(["nonexistent.txt"], dry_run=True)
         assert result.success is True
         assert result.commits_rewritten == 0
+
+
+@requires_git_filter_repo
+class TestFilterPaths:
+    """Test filter_paths dry-run operations."""
+
+    def test_filter_paths_include_dry_run(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.filter_paths(include_paths=["main.py"], dry_run=True)
+        assert result.success is True
+        assert result.dry_run is True
+
+    def test_filter_paths_exclude_dry_run(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.filter_paths(exclude_paths=["config.json"], dry_run=True)
+        assert result.success is True
+        assert result.dry_run is True
+
+    def test_filter_paths_include_and_exclude_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.filter_paths(
+            include_paths=["src/"], exclude_paths=["tests/"], dry_run=True,
+        )
+        assert result.success is False
+        assert "Cannot use include_paths and exclude_paths together" in result.message
+
+    def test_filter_paths_include_actually_filters(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.filter_paths(
+            include_paths=["README.md"], dry_run=False, force=True,
+        )
+        assert result.success is True
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        files = adapter2.list_all_files_in_history()
+        assert "README.md" in files
+        assert "config.json" not in files
+        assert "main.py" not in files
+
+
+@requires_git_filter_repo
+class TestAdditionalEdgeCases:
+    """Additional edge case coverage."""
+
+    def test_list_all_files_with_limit(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        files = adapter.list_all_files_in_history(limit=2)
+        assert len(files) == 2
+
+    def test_get_commits_with_branch(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits("HEAD")
+        assert len(commits) == 3
+
+    def test_analyze_history_has_all_fields(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        analysis = adapter.analyze_history()
+        assert "total_commits" in analysis
+        assert "authors" in analysis
+        assert "commits" in analysis
+        assert analysis["total_commits"] == 3
+        assert len(analysis["commits"]) == 3
+
+    def test_get_commit_files_returns_list(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        files = adapter.get_commit_files(commits[2].hash)  # Initial commit
+        assert "README.md" in files
+
+    def test_empty_repo_list_files(self, empty_git_repo):
+        adapter = GitFilterRepoAdapter(str(empty_git_repo))
+        files = adapter.list_all_files_in_history()
+        assert files == []
+
+    def test_squash_commits_dry_run_count(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        start = commits[2].hash  # Initial commit
+        result = adapter.squash_commits(start_commit=start, dry_run=True)
+        assert result.success is True
+        assert result.dry_run is True
+        assert result.commits_processed == 2
 
 
 class TestPathValidation:
