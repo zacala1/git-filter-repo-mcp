@@ -127,11 +127,11 @@ class GitFilterRepoAdapter:
         """Run a command in the repo directory."""
         try:
             return subprocess.run(
-                args, cwd=self.repo_path, capture_output=True, text=True,
+                args, cwd=self.repo_path, capture_output=True,
                 check=check, timeout=timeout, encoding="utf-8", errors="replace",
             )
         except subprocess.TimeoutExpired:
-            logger.error(f"timeout {timeout}s: {args[0]}")
+            logger.error("timeout %ds: %s", timeout, args[0])
             raise
 
     def _run_git(self, *args: str, timeout: int = TIMEOUT_DEFAULT) -> subprocess.CompletedProcess:
@@ -404,7 +404,7 @@ class GitFilterRepoAdapter:
                 if size > size_bytes:
                     large_files.append((objects_with_paths.get(blob_hash, blob_hash), size / (1024 * 1024)))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.warning(f"batch failed: {e}")
+            logger.warning("batch failed: %s", e)
             for blob_hash in object_hashes[:100]:
                 try:
                     size = _safe_int(self._run_git_fast("cat-file", "-s", blob_hash).stdout)
@@ -508,9 +508,8 @@ class GitFilterRepoAdapter:
             result = self._run_git("rev-parse", "--abbrev-ref", "HEAD")
             current_branch = result.stdout.strip()
 
-            # Reset to backup
+            # Reset to backup (preserve the backup branch for safety)
             self._run_git("reset", "--hard", backup_branch)
-            self._run_git("branch", "-D", backup_branch)
 
             return FilterResult(
                 success=True,

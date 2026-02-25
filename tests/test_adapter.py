@@ -410,6 +410,13 @@ class TestRealExecution:
         assert len(commits_after) == 3
         assert commits_after[0].hash == commits_before[0].hash
 
+        # Verify backup branch is preserved (not deleted)
+        branch_result = subprocess.run(
+            ["git", "branch", "--list", backup_branch],
+            cwd=temp_git_repo, capture_output=True, text=True,
+        )
+        assert backup_branch in branch_result.stdout
+
     def test_rewrite_single_commit_message(self, temp_git_repo):
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         commits = adapter.get_commits()

@@ -69,9 +69,9 @@ def load_config() -> Config:
                     data = json.load(f)
                     _apply_config_dict(config, data)
             except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse config file {config_path}: {e}")
+                logger.warning("Failed to parse config file %s: %s", config_path, e)
             except IOError as e:
-                logger.warning(f"Failed to read config file {config_path}: {e}")
+                logger.warning("Failed to read config file %s: %s", config_path, e)
 
     # Override with environment variables (highest priority)
     _apply_env_vars(config)

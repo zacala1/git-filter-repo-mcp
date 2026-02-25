@@ -67,7 +67,7 @@ def tool_handler(name: str):
             except RuntimeError as e:
                 return {"success": False, "error": str(e), "error_code": ErrorCode.COMMAND_FAILED}
             except Exception as e:
-                logger.exception(f"{name} failed")
+                logger.exception("%s failed", name)
                 return {"success": False, "error": f"Internal error: {type(e).__name__}", "error_code": ErrorCode.INTERNAL_ERROR}
         _HANDLERS[name] = wrapper
         return wrapper
@@ -459,13 +459,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         result = await _execute_tool(name, arguments)
         return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
     except Exception as e:
-        logger.exception(f"{name} failed")
+        logger.exception("%s failed", name)
         return [TextContent(type="text", text=json.dumps({"error": str(e), "success": False}, indent=2))]
 
 
 async def _execute_tool(name: str, args: dict[str, Any]) -> dict:
     """Dispatch tool execution to registered handler."""
-    logger.info(f"tool: {name}")
+    logger.info("tool: %s", name)
     handler = _HANDLERS.get(name)
     if handler is None:
         return {"success": False, "error": f"Unknown tool: {name}", "error_code": ErrorCode.TOOL_NOT_FOUND}
@@ -494,8 +494,9 @@ def main():
         asyncio.run(run_server())
     except KeyboardInterrupt:
         logger.info("stopped")
-    except Exception as e:
+    except Exception:
         logger.exception("fatal")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

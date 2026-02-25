@@ -156,13 +156,13 @@ class BaseProvider(ABC):
             return self._parse_response(raw, style)
         except httpx.ConnectError as e:
             self._last_error = f"Cannot connect to {self.provider_name}"
-            logger.warning(f"{self.provider_name.lower()} connect: {e}")
+            logger.warning("%s connect: %s", self.provider_name.lower(), e)
             if self.raise_on_error:
                 raise AIConnectionError(self.provider_name, self._last_error, e)
             return context.original_message
         except httpx.HTTPError as e:
             self._last_error = str(e)
-            logger.warning(f"{self.provider_name.lower()}: {e}")
+            logger.warning("%s: %s", self.provider_name.lower(), e)
             if self.raise_on_error:
                 raise AIConnectionError(self.provider_name, self._last_error, e)
             return context.original_message
@@ -277,7 +277,7 @@ class OpenAIProvider(BaseProvider):
         try:
             return result["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
-            logger.warning(f"openai unexpected response: {result}")
+            logger.warning("openai unexpected response: %s", result)
             if self.raise_on_error:
                 raise AIConnectionError("OpenAI", "Unexpected response format")
             return ""
@@ -340,7 +340,7 @@ class AnthropicProvider(BaseProvider):
         try:
             return result["content"][0]["text"] or ""
         except (KeyError, IndexError, TypeError):
-            logger.warning(f"anthropic unexpected response: {result}")
+            logger.warning("anthropic unexpected response: %s", result)
             if self.raise_on_error:
                 raise AIConnectionError("Anthropic", "Unexpected response format")
             return ""
