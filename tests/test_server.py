@@ -784,3 +784,77 @@ class TestChangeDatesHandler:
             mock_adapter.change_commit_dates.assert_called_once_with(
                 "random", True, True, None, dry_run=True, force=False,
             )
+
+
+class TestMainExitCode:
+    """Test that main() propagates fatal errors correctly."""
+
+    def test_fatal_error_raises_system_exit(self):
+        with patch("git_filter_repo_mcp.server.asyncio.run", side_effect=RuntimeError("boom")):
+            with pytest.raises(SystemExit) as exc_info:
+                from git_filter_repo_mcp.server import main
+                main()
+            assert exc_info.value.code == 1
+
+    def test_keyboard_interrupt_exits_cleanly(self):
+        with patch("git_filter_repo_mcp.server.asyncio.run", side_effect=KeyboardInterrupt):
+            from git_filter_repo_mcp.server import main
+            # Should not raise SystemExit
+            main()
+
+
+class TestAIRewriteUsesBulkFiles:
+    """Test that AI rewrite mode uses collect_commit_files (bulk)."""
+
+    @pytest.mark.asyncio
+    async def test_ai_rewrite_calls_collect_commit_files(self):
+        from unittest.mock import AsyncMock
+
+        mock_commits = [
+            CommitInfo("aaa111", "User", "u@e.com", "User", "u@e.com", "msg1", "2024-01-01"),
+            CommitInfo("bbb222", "User", "u@e.com", "User", "u@e.com", "msg2", "2024-01-02"),
+        ]
+
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
+             patch("git_filter_repo_mcp.server._create_ai_provider") as mock_create, \
+             patch("git_filter_repo_mcp.server._check_ai_connection", new_callable=AsyncMock, return_value=None):
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = mock_commits
+            mock_adapter.collect_commit_files.return_value = {
+                "aaa111": ["file1.py"],
+                "bbb222": ["file2.py"],
+            }
+            MockAdapter.return_value = mock_adapter
+
+            mock_provider = MagicMock()
+            mock_provider.generate_message = AsyncMock(side_effect=[
+                MagicMock(original="msg1", rewritten="feat: msg1", commit_hash="aaa111"),
+                MagicMock(original="msg2", rewritten="feat: msg2", commit_hash="bbb222"),
+            ])
+            mock_provider.close = AsyncMock()
+
+            mock_engine = MagicMock()
+            mock_engine.rewrite_message = AsyncMock(side_effect=[
+                MagicMock(original="msg1", rewritten="feat: msg1", commit_hash="aaa111"),
+                MagicMock(original="msg2", rewritten="feat: msg2", commit_hash="bbb222"),
+            ])
+            mock_engine.close = AsyncMock()
+
+            with patch("git_filter_repo_mcp.server.AICommitEngine", return_value=mock_engine):
+                mock_create.return_value = mock_provider
+
+                result = await _execute_tool(
+                    "rewrite_commit_messages",
+                    {
+                        "repo_path": "/tmp/repo",
+                        "use_ai": True,
+                        "ai_provider": "ollama",
+                        "dry_run": True,
+                    },
+                )
+
+                # Verify bulk method was called, NOT per-commit get_commit_files
+                mock_adapter.collect_commit_files.assert_called_once_with(
+                    mock_commits, "HEAD", 2,
+                )
+                mock_adapter.get_commit_files.assert_not_called()

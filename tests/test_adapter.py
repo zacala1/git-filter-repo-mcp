@@ -706,3 +706,48 @@ class TestPathValidation:
         path = "C:\\nonexistent\\path\\to\\repo" if platform.system() == "Windows" else "/nonexistent/path/to/repo"
         with pytest.raises(ValueError, match="does not exist"):
             GitFilterRepoAdapter(path)
+
+
+@requires_git_filter_repo
+class TestMaxCountZero:
+    """Test that max_count=0 returns zero commits, not all."""
+
+    def test_max_count_zero_returns_empty(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits(max_count=0)
+        assert commits == []
+
+    def test_max_count_none_returns_all(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits(max_count=None)
+        assert len(commits) == 3
+
+
+@requires_git_filter_repo
+class TestCollectCommitFiles:
+    """Test bulk collect_commit_files method."""
+
+    def test_bulk_collect_returns_files_per_commit(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        result = adapter.collect_commit_files(commits, "HEAD", len(commits))
+
+        assert isinstance(result, dict)
+        # Should have entries for each commit hash
+        for commit in commits:
+            assert commit.hash in result
+            assert isinstance(result[commit.hash], list)
+
+        # "Add config" commit should include config.json
+        config_commit = [c for c in commits if c.message == "Add config"][0]
+        assert "config.json" in result[config_commit.hash]
+
+    def test_bulk_collect_matches_individual(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        bulk = adapter.collect_commit_files(commits, "HEAD", len(commits))
+
+        # Compare with individual get_commit_files calls
+        for commit in commits:
+            individual = adapter.get_commit_files(commit.hash)
+            assert sorted(bulk.get(commit.hash, [])) == sorted(individual)
