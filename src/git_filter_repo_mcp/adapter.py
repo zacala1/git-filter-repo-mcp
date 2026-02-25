@@ -353,8 +353,11 @@ class GitFilterRepoAdapter:
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 affected = set()
                 for path in paths:
-                    result = self._run_git("log", "--all", "--format=%H", "--", path)
-                    affected.update(_parse_lines(result.stdout))
+                    try:
+                        result = self._run_git("log", "--all", "--format=%H", "--", path)
+                        affected.update(_parse_lines(result.stdout))
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                        continue
 
             return FilterResult(
                 success=True, message=f"Dry run: {len(affected)} commits affected",
@@ -441,6 +444,13 @@ class GitFilterRepoAdapter:
         git-filter-repo's --invert-paths is a global flag that inverts ALL
         path selections. Use one or the other per invocation.
         """
+        if not include_paths and not exclude_paths:
+            return FilterResult(
+                success=False,
+                message="No paths specified",
+                error="Provide include_paths or exclude_paths.",
+            )
+
         if include_paths and exclude_paths:
             return FilterResult(
                 success=False,
@@ -681,7 +691,10 @@ class GitFilterRepoAdapter:
 
     def squash_commits(self, start_commit: str, end_commit: str = "HEAD", new_message: str | None = None, dry_run: bool = True) -> FilterResult:
         """Squash a range of commits into one."""
-        commit_count = _safe_int(self._run_git("rev-list", "--count", f"{start_commit}..{end_commit}").stdout)
+        try:
+            commit_count = _safe_int(self._run_git("rev-list", "--count", f"{start_commit}..{end_commit}").stdout)
+        except subprocess.CalledProcessError:
+            return FilterResult(success=False, message=f"Invalid commit range: {start_commit}..{end_commit}")
         if commit_count == 0:
             return FilterResult(success=False, message=f"Invalid commit range: {start_commit}..{end_commit}")
 
@@ -811,6 +824,7 @@ class GitFilterRepoAdapter:
         for commit_hash, orig_dt in commit_dates:
             tz_offset = orig_dt.strftime("%z") or "+0000"
 
+            new_dt = current_date  # default in case all 100 attempts fail
             found_valid = False
             for _ in range(100):
                 if end_hour >= start_hour:

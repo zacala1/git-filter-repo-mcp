@@ -546,6 +546,12 @@ class TestFilterPaths:
         assert result.success is True
         assert result.dry_run is True
 
+    def test_filter_paths_no_paths_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.filter_paths(dry_run=True)
+        assert result.success is False
+        assert "No paths specified" in result.message
+
     def test_filter_paths_include_and_exclude_rejected(self, temp_git_repo):
         adapter = GitFilterRepoAdapter(str(temp_git_repo))
         result = adapter.filter_paths(
@@ -610,6 +616,12 @@ class TestAdditionalEdgeCases:
         assert result.success is True
         assert result.dry_run is True
         assert result.commits_processed == 2
+
+    def test_squash_invalid_range(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.squash_commits(start_commit="0000000000000000000000000000000000000000", dry_run=True)
+        assert result.success is False
+        assert "Invalid commit range" in result.message
 
 
 class TestCommitHashValidation:
