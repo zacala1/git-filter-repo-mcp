@@ -612,6 +612,55 @@ class TestAdditionalEdgeCases:
         assert result.commits_processed == 2
 
 
+class TestCommitHashValidation:
+    """Test that commit hash injection is prevented."""
+
+    def test_valid_hex_hash_accepted(self):
+        adapter = _make_mock_adapter()
+        # Should not raise
+        adapter._validate_commit_hash("abc123def456")
+        adapter._validate_commit_hash("0" * 40)
+        adapter._validate_commit_hash("ABCDEF")
+
+    def test_injection_attempt_rejected(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError, match="Invalid commit hash"):
+            adapter._validate_commit_hash('"; import os; os.system("rm -rf /"); "')
+
+    def test_spaces_rejected(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError, match="Invalid commit hash"):
+            adapter._validate_commit_hash("abc 123")
+
+    def test_empty_string_rejected(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError, match="Invalid commit hash"):
+            adapter._validate_commit_hash("")
+
+
+@requires_git_filter_repo
+class TestMultilineCommitMessage:
+    """Test that multi-line commit messages are fully preserved."""
+
+    def test_multiline_message_preserved(self, multiline_commit_repo):
+        adapter = GitFilterRepoAdapter(str(multiline_commit_repo))
+        commits = adapter.get_commits()
+        assert len(commits) == 1
+        assert "feat: add app" in commits[0].message
+        assert "main application" in commits[0].message
+        assert "multiple lines" in commits[0].message
+
+    def test_multiline_rewrite_dry_run(self, multiline_commit_repo):
+        adapter = GitFilterRepoAdapter(str(multiline_commit_repo))
+
+        def callback(msg, _hash):
+            return f"[REWRITTEN] {msg}"
+
+        result = adapter.rewrite_commit_messages(callback, dry_run=True)
+        assert result.success is True
+        assert result.commits_rewritten == 1
+
+
 class TestPathValidation:
     """Test path validation in _validate_repo."""
 

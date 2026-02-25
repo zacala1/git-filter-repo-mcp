@@ -155,11 +155,18 @@ class GitFilterRepoAdapter:
     # Record separator that won't appear in commit messages/names
     _FIELD_SEP = "\x1e"
 
+    # Record separator for multi-record git log output (rendered by git via %x00)
+    _RECORD_SEP = "\x00"
+
     def get_commits(self, branch: str = "HEAD", max_count: int | None = None) -> list[CommitInfo]:
         """Get commit information from the repository."""
         sep = self._FIELD_SEP
-        args = ["log", f"--format=%H{sep}%an{sep}%ae{sep}%cn{sep}%ce{sep}%s{sep}%aI", branch]
-        if max_count:
+        # Use %B (full body) instead of %s (subject only) to preserve multi-line messages.
+        # Put %B last so split(sep, 6) captures the entire body in the final field.
+        # Use %x00 (git's hex escape for null byte) as record separator — can't use literal
+        # \x00 in args because Windows subprocess rejects embedded null characters.
+        args = ["log", f"--format=%x00%H{sep}%an{sep}%ae{sep}%cn{sep}%ce{sep}%aI{sep}%B", branch]
+        if max_count is not None:
             args.append(f"-n{max_count}")
 
         try:
@@ -168,10 +175,18 @@ class GitFilterRepoAdapter:
             # Empty repo or invalid branch — no commits
             return []
         commits = []
-        for line in _parse_lines(result.stdout):
-            parts = line.split(sep, 6)
+        for record in result.stdout.split(self._RECORD_SEP):
+            record = record.strip()
+            if not record:
+                continue
+            # Fields: hash, author_name, author_email,
+            # committer_name, committer_email, date, message (last, may contain sep)
+            parts = record.split(sep, 6)
             if len(parts) >= 7:
-                commits.append(CommitInfo(*parts[:7]))
+                # Reorder to match CommitInfo: hash, author_name, author_email,
+                # committer_name, committer_email, message, date
+                h, an, ae, cn, ce, date, message = parts
+                commits.append(CommitInfo(h, an, ae, cn, ce, message.strip(), date))
         return commits
 
     def get_commit_diff(self, commit_hash: str) -> str:
@@ -571,6 +586,12 @@ class GitFilterRepoAdapter:
             "sensitive_file_list": sensitive_files[:MAX_PREVIEW_COMMITS], "files_scanned": len(files_to_scan),
         }
 
+    @staticmethod
+    def _validate_commit_hash(commit_hash: str) -> None:
+        """Validate commit hash is safe hex string (prevents code injection in callbacks)."""
+        if not re.match(r'^[0-9a-fA-F]+$', commit_hash):
+            raise ValueError(f"Invalid commit hash (must be hex): {commit_hash!r}")
+
     def rewrite_single_commit(
         self,
         commit_hash: str,
@@ -580,6 +601,7 @@ class GitFilterRepoAdapter:
         force: bool = True,
     ) -> FilterResult:
         """Rewrite a single commit's message and/or author in one filter-repo pass."""
+        self._validate_commit_hash(commit_hash)
         changes = {}
         if new_message:
             changes["message"] = new_message

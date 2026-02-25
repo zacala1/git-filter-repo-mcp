@@ -95,3 +95,21 @@ def unicode_git_repo():
         _commit(repo_path, "feat: add unicode support \u2728")
 
         yield repo_path
+
+
+@pytest.fixture
+def multiline_commit_repo():
+    """Create a git repo with multi-line commit messages (subject + body)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir) / "multiline_repo"
+        repo_path.mkdir()
+        _init_repo(repo_path)
+
+        (repo_path / "app.py").write_text("print('app')")
+        subprocess.run(["git", "add", "."], cwd=repo_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "feat: add app\n\nThis adds the main application.\nWith multiple lines in body."],
+            cwd=repo_path, capture_output=True,
+        )
+
+        yield repo_path
