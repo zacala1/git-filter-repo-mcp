@@ -145,10 +145,13 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                 return err
 
             commits = await asyncio.to_thread(adapter.get_commits, params.branch)
+            commit_files = await asyncio.to_thread(
+                adapter.collect_commit_files, commits, params.branch, len(commits),
+            )
             rewrites = []
 
             for commit in commits:
-                files = await asyncio.to_thread(adapter.get_commit_files, commit.hash)
+                files = commit_files.get(commit.hash, [])
                 result = await engine.rewrite_message(commit.message, commit.hash, files)
                 if result.rewritten != commit.message:
                     rewrites.append({

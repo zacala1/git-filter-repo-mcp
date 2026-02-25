@@ -522,7 +522,7 @@ class GitFilterRepoAdapter:
                 error=str(e),
             )
 
-    def _collect_commit_files(
+    def collect_commit_files(
         self, commits: list[CommitInfo], branch: str, max_commits: int,
     ) -> dict[str, list[str]]:
         """Collect file lists for commits, bulk-fetched with per-commit fallback."""
@@ -574,7 +574,7 @@ class GitFilterRepoAdapter:
         from .secrets import get_file_risk_level, is_sensitive_file
 
         commits = self.get_commits(branch, max_commits)
-        commit_files_map = self._collect_commit_files(commits, branch, max_commits)
+        commit_files_map = self.collect_commit_files(commits, branch, max_commits)
 
         sensitive_files = []
         files_to_scan: list[tuple[str, str]] = []
