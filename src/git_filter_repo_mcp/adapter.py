@@ -115,7 +115,7 @@ class GitFilterRepoAdapter:
         if not self.repo_path.exists():
             raise ValueError(f"Repository path does not exist: {self.repo_path}")
         git_dir = self.repo_path / ".git"
-        if not git_dir.exists():
+        if not git_dir.exists() or not git_dir.is_dir():
             raise ValueError(f"Not a git repository: {self.repo_path}")
 
     def _check_git_filter_repo(self) -> None:
@@ -306,6 +306,14 @@ class GitFilterRepoAdapter:
         force: bool = False,
     ) -> FilterResult:
         """Change author/committer information for commits."""
+        # Sanitize inputs before any operation (including dry_run)
+        for label, value in [("name", new_name), ("email", new_email), ("old_email", old_email)]:
+            if any(c in value for c in "<>\n\r"):
+                return FilterResult(
+                    success=False,
+                    message=f"Invalid characters in {label}: angle brackets and newlines are not allowed",
+                )
+
         # Count affected commits
         commits = self.get_commits()
         affected = [c for c in commits if c.author_email == old_email]
@@ -350,6 +358,7 @@ class GitFilterRepoAdapter:
         force: bool = False,
     ) -> FilterResult:
         """Remove files from entire git history."""
+        self._validate_paths(paths)
         if dry_run:
             try:
                 result = self._run_git("log", "--all", "--format=%H", "--", *paths)
@@ -380,7 +389,10 @@ class GitFilterRepoAdapter:
         self, size_threshold_mb: float = 10.0, dry_run: bool = True, force: bool = False,
     ) -> FilterResult:
         """Remove files larger than threshold from history."""
-        result = self._run_git("rev-list", "--objects", "--all")
+        try:
+            result = self._run_git("rev-list", "--objects", "--all")
+        except subprocess.CalledProcessError:
+            return FilterResult(success=True, message="No objects found (empty repository?)", dry_run=dry_run)
         size_bytes = int(size_threshold_mb * 1024 * 1024)
 
         # Parse objects with paths
@@ -401,7 +413,8 @@ class GitFilterRepoAdapter:
             batch_result = subprocess.run(
                 ["git", "cat-file", "--batch-check=%(objectsize)"],
                 cwd=self.repo_path, input="\n".join(object_hashes),
-                capture_output=True, text=True, timeout=TIMEOUT_DEFAULT,
+                capture_output=True, encoding="utf-8", errors="replace",
+                timeout=TIMEOUT_DEFAULT,
             )
             for blob_hash, size_str in zip(object_hashes, _parse_lines(batch_result.stdout)):
                 size = _safe_int(size_str)
@@ -448,6 +461,7 @@ class GitFilterRepoAdapter:
         git-filter-repo's --invert-paths is a global flag that inverts ALL
         path selections. Use one or the other per invocation.
         """
+        self._validate_paths((include_paths or []) + (exclude_paths or []))
         if not include_paths and not exclude_paths:
             return FilterResult(
                 success=False,
@@ -499,7 +513,7 @@ class GitFilterRepoAdapter:
 
     def create_backup(self) -> str:
         """Create a backup branch before rewriting."""
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_branch = f"backup_{timestamp}"
 
         self._run_git("branch", backup_branch)
@@ -537,7 +551,7 @@ class GitFilterRepoAdapter:
             commit_files_map: dict[str, list[str]] = {}
             current_hash = None
             for line in _parse_lines(result.stdout):
-                if len(line) == 40 and all(c in "0123456789abcdef" for c in line):
+                if len(line) in (40, 64) and all(c in "0123456789abcdef" for c in line):
                     current_hash = line
                     commit_files_map[current_hash] = []
                 elif current_hash:
@@ -598,6 +612,15 @@ class GitFilterRepoAdapter:
             "sensitive_files": len(sensitive_files), "findings": findings[:MAX_FINDINGS_LIMIT],
             "sensitive_file_list": sensitive_files[:MAX_PREVIEW_COMMITS], "files_scanned": len(files_to_scan),
         }
+
+    @staticmethod
+    def _validate_paths(paths: list[str]) -> None:
+        """Validate paths don't contain git-filter-repo option injection."""
+        for path in paths:
+            if not path:
+                raise ValueError("Invalid path: empty string")
+            if path.startswith("-"):
+                raise ValueError(f"Invalid path (must not start with '-'): {path!r}")
 
     @staticmethod
     def _validate_commit_hash(commit_hash: str) -> None:
@@ -662,9 +685,9 @@ class GitFilterRepoAdapter:
             )
 
         changes_made = []
-        if new_message:
+        if new_message is not None:
             changes_made.append("message")
-        if new_author_name or new_author_email:
+        if new_author_name is not None or new_author_email is not None:
             changes_made.append("author")
 
         return FilterResult(
@@ -693,16 +716,35 @@ class GitFilterRepoAdapter:
         return history
 
     def squash_commits(self, start_commit: str, end_commit: str = "HEAD", new_message: str | None = None, dry_run: bool = True) -> FilterResult:
-        """Squash a range of commits into one."""
+        """Squash commits between start_commit (exclusive) and end_commit (inclusive).
+
+        Uses ``git reset --soft`` + ``git commit``, so end_commit must resolve
+        to the current HEAD.  If end_commit is not HEAD the operation is
+        rejected to avoid silent data loss.
+        """
         try:
             commit_count = _safe_int(self._run_git("rev-list", "--count", f"{start_commit}..{end_commit}").stdout)
         except subprocess.CalledProcessError:
             return FilterResult(success=False, message=f"Invalid commit range: {start_commit}..{end_commit}")
         if commit_count == 0:
-            return FilterResult(success=False, message=f"Invalid commit range: {start_commit}..{end_commit}")
+            return FilterResult(success=False, message=f"No commits in range: {start_commit}..{end_commit}")
 
         if dry_run:
             return FilterResult(success=True, message=f"Dry run: would squash {commit_count} commits", commits_processed=commit_count, dry_run=True)
+
+        # Ensure end_commit points to HEAD to avoid silent data loss
+        try:
+            head_hash = self._run_git("rev-parse", "HEAD").stdout.strip()
+            end_hash = self._run_git("rev-parse", end_commit).stdout.strip()
+        except subprocess.CalledProcessError:
+            return FilterResult(success=False, message=f"Cannot resolve commits: {end_commit}")
+
+        if head_hash != end_hash:
+            return FilterResult(
+                success=False,
+                message=f"end_commit must be HEAD (got {end_commit}). "
+                "Squashing a range that does not end at HEAD is not supported.",
+            )
 
         try:
             if new_message is None:
@@ -719,14 +761,8 @@ class GitFilterRepoAdapter:
         self, old_text: str, new_text: str, file_pattern: str | None = None, dry_run: bool = True, force: bool = False,
     ) -> FilterResult:
         """Replace text throughout repository history."""
-        # Escape ==> in new_text to prevent git-filter-repo expression parsing issues
-        safe_new_text = new_text.replace("==>", "\\=\\=\\>")
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write(f"regex:{re.escape(old_text)}==>{safe_new_text}\n")
-            expressions_path = f.name
-
         if dry_run:
-            # Search git history (not working directory) for affected files
+            # Search git history (not working directory) for affected files — no temp file needed
             try:
                 git_args = ["log", "--all", "-S", old_text, "--name-only", "--format="]
                 if file_pattern:
@@ -735,8 +771,13 @@ class GitFilterRepoAdapter:
                 files_with_matches = sorted(set(_parse_lines(result.stdout)))
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 files_with_matches = []
-            Path(expressions_path).unlink(missing_ok=True)
             return FilterResult(success=True, message=f"Dry run: {len(files_with_matches)} files in history", files_affected=files_with_matches[:20], dry_run=True)
+
+        # Create expressions file only for actual execution
+        safe_new_text = new_text.replace("==>", "\\=\\=\\>")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(f"regex:{re.escape(old_text)}==>{safe_new_text}\n")
+            expressions_path = f.name
 
         try:
             args = ["--replace-text", expressions_path]
@@ -817,7 +858,9 @@ class GitFilterRepoAdapter:
 
         if start_date:
             try:
-                base_date = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+                base_date = datetime.datetime.strptime(start_date, "%Y-%m-%d").replace(
+                    tzinfo=datetime.timezone.utc,
+                )
             except ValueError:
                 return FilterResult(
                     success=False,
@@ -825,7 +868,7 @@ class GitFilterRepoAdapter:
                     error="Use YYYY-MM-DD format",
                 )
         else:
-            base_date = commit_dates[0][1] if commit_dates else datetime.datetime.now()
+            base_date = commit_dates[0][1] if commit_dates else datetime.datetime.now(datetime.timezone.utc)
 
         date_mappings: dict[str, tuple[int, str]] = {}
         current_date = base_date
@@ -865,6 +908,10 @@ class GitFilterRepoAdapter:
                 if preserve_order and prev_timestamp:
                     if new_dt <= prev_timestamp:
                         new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 60))
+                        # If weekend_only, ensure we stay on a weekend
+                        if weekend_only and new_dt.weekday() < 5:
+                            days_until_saturday = (5 - new_dt.weekday()) % 7 or 7
+                            new_dt = new_dt + datetime.timedelta(days=days_until_saturday)
                         current_date = new_dt
 
                 found_valid = True
@@ -935,11 +982,12 @@ class GitFilterRepoAdapter:
             return mappings
 
         if dry_run:
+            commit_by_hash = {c.hash: c for c in commits}
             preview = []
             for commit_hash, (new_ts, tz) in list(mappings.items())[:10]:
-                orig_commit = next((c for c in commits if c.hash == commit_hash), None)
+                orig_commit = commit_by_hash.get(commit_hash)
                 if orig_commit:
-                    new_dt = datetime.datetime.fromtimestamp(new_ts)
+                    new_dt = datetime.datetime.fromtimestamp(new_ts, tz=datetime.timezone.utc)
                     preview.append(
                         f"{commit_hash[:8]}: {orig_commit.date[:19]} -> {new_dt.isoformat()[:19]}"
                     )

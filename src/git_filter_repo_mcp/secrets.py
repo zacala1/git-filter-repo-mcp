@@ -181,7 +181,7 @@ class SecretFinding:
     context: str | None = None
 
 
-def redact_secret(text: str, visible_chars: int = 4) -> str:
+def redact_secret(text: str) -> str:
     """Redact a secret with hash identifier for tracking."""
     # Generate short hash for tracking without exposing secret content
     text_hash = hashlib.sha256(text.encode()).hexdigest()[:8]
@@ -245,7 +245,7 @@ def scan_content(
                     commit_hash=commit_hash,
                     line_number=line_number,
                     matched_text=redact_secret(matched_text),
-                    context=redact_secret(context, 10),
+                    context=redact_secret(context),
                 )
             )
 

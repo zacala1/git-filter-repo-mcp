@@ -5,6 +5,7 @@ __version__ = "0.1.0"
 from .adapter import CommitInfo, FilterResult, GitFilterRepoAdapter
 from .ai_engine import (
     AICommitEngine,
+    AIConnectionError,
     AnthropicProvider,
     CommitContext,
     MessageStyle,
@@ -26,6 +27,7 @@ __all__ = [
     "CommitInfo",
     # AI Engine
     "AICommitEngine",
+    "AIConnectionError",
     "MessageStyle",
     "CommitContext",
     "RewriteResult",
