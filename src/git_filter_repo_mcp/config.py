@@ -110,7 +110,7 @@ def _apply_env_vars(config: Config) -> None:
     """Apply environment variables to config."""
     # AI settings
     if provider := os.getenv("GIT_FILTER_REPO_AI_PROVIDER"):
-        config.ai.provider = provider
+        config.ai.provider = provider  # type: ignore[assignment]
 
     if model := os.getenv("GIT_FILTER_REPO_AI_MODEL"):
         config.ai.model = model

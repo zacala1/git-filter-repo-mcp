@@ -190,8 +190,10 @@ async def _handle_rewrite_messages(args: dict) -> dict:
             await engine.close()
 
     elif params.manual_mappings:
+        mappings = params.manual_mappings
+
         def callback(msg: str, _: str) -> str:
-            return params.manual_mappings.get(msg, msg)
+            return mappings.get(msg, msg)
 
         result = await asyncio.to_thread(
             adapter.rewrite_commit_messages,

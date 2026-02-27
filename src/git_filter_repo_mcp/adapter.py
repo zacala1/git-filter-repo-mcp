@@ -26,6 +26,9 @@ MAX_PREVIEW_COMMITS = 20
 MAX_FINDINGS_LIMIT = 50
 MAX_FILES_TO_SCAN = 200
 
+# Date randomization: probability of advancing to the next day between commits
+DATE_ADVANCE_PROBABILITY = 0.3
+
 
 def _parse_lines(output: str) -> list[str]:
     """Parse stdout into non-empty lines."""
@@ -86,7 +89,8 @@ class GitFilterRepoAdapter:
 
         # Git Bash style: /c/Users/... -> C:\Users\...
         if match := re.match(r"^/([a-zA-Z])/(.*)$", path):
-            return f"{match.group(1).upper()}:\\{match.group(2).replace('/', '\\')}"
+            sep = "\\"
+            return f"{match.group(1).upper()}:{sep}{match.group(2).replace('/', sep)}"
 
         # WSL paths - keep as-is
         if path.startswith(("//wsl", "\\\\wsl")):
@@ -873,7 +877,7 @@ class GitFilterRepoAdapter:
             date_mappings[commit_hash] = (int(new_dt.timestamp()), tz_offset)
             prev_timestamp = new_dt
 
-            if random.random() < 0.3:
+            if random.random() < DATE_ADVANCE_PROBABILITY:
                 current_date = current_date + datetime.timedelta(days=1)
 
         return date_mappings

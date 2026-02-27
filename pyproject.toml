@@ -42,6 +42,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.1.0",
+    "pyright>=1.1.0",
 ]
 
 [project.scripts]
@@ -57,6 +58,11 @@ packages = ["src/git_filter_repo_mcp"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+include = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -125,15 +125,30 @@ Original commit message: "{context.original_message}"
 Respond with ONLY the new commit message, nothing else. Do not include quotes around the message."""
 
 
+# Default AI generation parameters
+DEFAULT_TEMPERATURE = 0.3
+DEFAULT_TOP_P = 0.9
+DEFAULT_MAX_TOKENS = 200
+
+
 class BaseProvider(ABC):
     """Base class for AI providers with shared error handling."""
 
     provider_name: str = "base"
 
-    def __init__(self, model: str, raise_on_error: bool = True):
+    def __init__(
+        self,
+        model: str,
+        raise_on_error: bool = True,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ):
         self.model = model
         self.raise_on_error = raise_on_error
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         self._last_error: str | None = None
+        self.client: httpx.AsyncClient  # set by subclass _create_client()
 
     @abstractmethod
     def _create_client(self) -> httpx.AsyncClient: ...
@@ -181,8 +196,9 @@ class BaseProvider(ABC):
 
         return message
 
-    async def close(self):
-        await self.client.aclose()
+    async def close(self) -> None:
+        if hasattr(self, "client"):
+            await self.client.aclose()
 
 
 class OllamaProvider(BaseProvider):
@@ -195,8 +211,10 @@ class OllamaProvider(BaseProvider):
         base_url: str = "http://localhost:11434",
         model: str = "llama3.2",
         raise_on_error: bool = True,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ):
-        super().__init__(model, raise_on_error)
+        super().__init__(model, raise_on_error, temperature, max_tokens)
         self.base_url = base_url
         self.client = self._create_client()
 
@@ -224,7 +242,7 @@ class OllamaProvider(BaseProvider):
                 "model": self.model,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.3, "top_p": 0.9},
+                "options": {"temperature": self.temperature, "top_p": DEFAULT_TOP_P},
             },
         )
         response.raise_for_status()
@@ -236,8 +254,15 @@ class OpenAIProvider(BaseProvider):
 
     provider_name = "OpenAI"
 
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini", raise_on_error: bool = True):
-        super().__init__(model, raise_on_error)
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4o-mini",
+        raise_on_error: bool = True,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ):
+        super().__init__(model, raise_on_error, temperature, max_tokens)
         self.api_key = api_key
         self.client = self._create_client()
 
@@ -268,8 +293,8 @@ class OpenAIProvider(BaseProvider):
                     {"role": "system", "content": "You are a git commit message writer. Respond only with the commit message."},
                     {"role": "user", "content": prompt},
                 ],
-                "temperature": 0.3,
-                "max_tokens": 200,
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
             },
         )
         response.raise_for_status()
@@ -288,8 +313,15 @@ class AnthropicProvider(BaseProvider):
 
     provider_name = "Anthropic"
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514", raise_on_error: bool = True):
-        super().__init__(model, raise_on_error)
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "claude-sonnet-4-20250514",
+        raise_on_error: bool = True,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ):
+        super().__init__(model, raise_on_error, temperature, max_tokens)
         self.api_key = api_key
         self.client = self._create_client()
 
@@ -330,7 +362,7 @@ class AnthropicProvider(BaseProvider):
             "https://api.anthropic.com/v1/messages",
             json={
                 "model": self.model,
-                "max_tokens": 200,
+                "max_tokens": self.max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
                 "system": "You are a git commit message writer. Respond only with the commit message, nothing else.",
             },
@@ -399,9 +431,9 @@ class AICommitEngine:
             *(_limited(h, m, f) for h, m, f in commits)
         ))
 
-    async def close(self):
+    async def close(self) -> None:
         if hasattr(self.provider, "close"):
-            await self.provider.close()
+            await self.provider.close()  # type: ignore[union-attr]
 
 
 def get_provider(
