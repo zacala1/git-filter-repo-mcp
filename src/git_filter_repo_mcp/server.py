@@ -35,9 +35,8 @@ from .tools import (
     SquashCommitsInput,
 )
 
-# Config and logging
-config = get_config()
-logging.basicConfig(level=getattr(logging, config.server.log_level, logging.INFO))
+# Logging setup — use get_config() lazily so reload_config() takes effect
+logging.basicConfig(level=getattr(logging, get_config().server.log_level, logging.INFO))
 logger = logging.getLogger(__name__)
 
 server = Server("git-filter-repo-mcp")
@@ -62,7 +61,7 @@ def tool_handler(name: str):
                 return {"success": False, "error": f"Invalid input: {details}", "error_code": ErrorCode.INVALID_INPUT}
             except ValueError as e:
                 msg = str(e)
-                code = ErrorCode.REPO_NOT_FOUND if "Not a git repository" in msg else ErrorCode.COMMAND_FAILED
+                code = ErrorCode.REPO_NOT_FOUND if ("Not a git repository" in msg or "does not exist" in msg) else ErrorCode.COMMAND_FAILED
                 return {"success": False, "error": msg, "error_code": code}
             except RuntimeError as e:
                 return {"success": False, "error": str(e), "error_code": ErrorCode.COMMAND_FAILED}
@@ -89,16 +88,14 @@ def result_to_dict(result: FilterResult) -> dict:
 
 def _create_ai_provider(args: dict, provider_name: str):
     """Create an AI provider from args and config."""
-    api_keys = {
-        "openai": config.ai.openai_api_key,
-        "anthropic": config.ai.anthropic_api_key,
-    }
-    return get_provider(
-        provider_name,
-        model=args.get("ai_model", config.ai.model),
-        api_key=api_keys.get(provider_name),
-        base_url=config.ai.ollama_base_url,
-    )
+    cfg = get_config()
+    kwargs: dict = {"model": args.get("ai_model") or cfg.ai.model}
+    if provider_name == "ollama":
+        kwargs["base_url"] = cfg.ai.ollama_base_url
+    elif provider_name in ("openai", "anthropic"):
+        api_keys = {"openai": cfg.ai.openai_api_key, "anthropic": cfg.ai.anthropic_api_key}
+        kwargs["api_key"] = api_keys.get(provider_name)
+    return get_provider(provider_name, **kwargs)
 
 
 async def _check_ai_connection(provider, provider_name: str) -> dict | None:
@@ -136,7 +133,7 @@ async def _handle_rewrite_messages(args: dict) -> dict:
     adapter = await asyncio.to_thread(GitFilterRepoAdapter, params.repo_path)
 
     if params.use_ai:
-        ai_provider_name = params.ai_provider or config.ai.provider
+        ai_provider_name = params.ai_provider or get_config().ai.provider
         provider = _create_ai_provider(args, ai_provider_name)
         engine = AICommitEngine(provider, MessageStyle(params.style))
 
@@ -148,11 +145,15 @@ async def _handle_rewrite_messages(args: dict) -> dict:
             commit_files = await asyncio.to_thread(
                 adapter.collect_commit_files, commits, params.branch, len(commits),
             )
-            rewrites = []
 
-            for commit in commits:
-                files = commit_files.get(commit.hash, [])
-                result = await engine.rewrite_message(commit.message, commit.hash, files)
+            batch_input = [
+                (c.hash, c.message, commit_files.get(c.hash, []))
+                for c in commits
+            ]
+            results = await engine.rewrite_batch(batch_input)
+
+            rewrites = []
+            for commit, result in zip(commits, results):
                 if result.rewritten != commit.message:
                     rewrites.append({
                         "hash": commit.hash,
@@ -307,6 +308,10 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
     params = RewriteSingleCommitInput(**args)
     adapter = await asyncio.to_thread(GitFilterRepoAdapter, params.repo_path)
     commit_hash = params.commit_hash
+    try:
+        adapter._validate_commit_hash(commit_hash)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "error_code": ErrorCode.INVALID_INPUT}
     commits = await asyncio.to_thread(adapter.get_commits, commit_hash, 1)
     if not commits:
         return {"success": False, "error": f"Commit not found: {commit_hash}", "error_code": ErrorCode.INVALID_INPUT}
@@ -315,7 +320,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
     new_message = params.new_message
 
     if not new_message and params.use_ai:
-        ai_provider_name = params.ai_provider or config.ai.provider
+        ai_provider_name = params.ai_provider or get_config().ai.provider
         provider = _create_ai_provider(args, ai_provider_name)
         engine = AICommitEngine(provider, MessageStyle.CONVENTIONAL)
         try:
@@ -330,7 +335,16 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
             await engine.close()
 
     has_message_change = new_message and new_message != commit.message
+    has_partial_author = bool(params.new_author_email) != bool(params.new_author_name)
     has_author_change = params.new_author_email and params.new_author_name
+
+    if has_partial_author:
+        missing = "new_author_name" if params.new_author_email else "new_author_email"
+        return {
+            "success": False,
+            "error": f"Both new_author_name and new_author_email are required (missing: {missing})",
+            "error_code": ErrorCode.INVALID_INPUT,
+        }
 
     if not has_message_change and not has_author_change and not params.dry_run:
         return {
@@ -376,7 +390,7 @@ async def _handle_squash_commits(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+        backup = adapter.create_backup() if get_config().server.auto_backup and not params.dry_run else None
         result = adapter.squash_commits(params.start_commit, params.end_commit, params.new_message, params.dry_run)
         response = result_to_dict(result)
         if backup:
@@ -392,7 +406,7 @@ async def _handle_replace_text(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+        backup = adapter.create_backup() if get_config().server.auto_backup and not params.dry_run else None
         result = adapter.replace_text_in_history(
             params.old_text, params.new_text, params.file_pattern, params.dry_run, not params.dry_run,
         )
@@ -432,7 +446,7 @@ async def _handle_change_dates(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = adapter.create_backup() if config.server.auto_backup and not params.dry_run else None
+        backup = adapter.create_backup() if get_config().server.auto_backup and not params.dry_run else None
         result = adapter.change_commit_dates(
             params.time_range, params.weekend_only, params.preserve_order,
             params.start_date, dry_run=params.dry_run, force=not params.dry_run,

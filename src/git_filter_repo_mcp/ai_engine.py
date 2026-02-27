@@ -440,11 +440,21 @@ def get_provider(
     provider_type: str = "ollama",
     **kwargs,
 ) -> AIProvider:
-    """Provider factory."""
+    """Provider factory.
+
+    Common kwargs: model, temperature, max_tokens, raise_on_error.
+    Provider-specific: base_url (ollama), api_key (openai/anthropic).
+    """
+    common = {}
+    for key in ("temperature", "max_tokens", "raise_on_error"):
+        if key in kwargs:
+            common[key] = kwargs[key]
+
     if provider_type == "ollama":
         return OllamaProvider(
             base_url=kwargs.get("base_url", "http://localhost:11434"),
             model=kwargs.get("model", "llama3.2"),
+            **common,
         )
     elif provider_type == "openai":
         api_key = kwargs.get("api_key")
@@ -453,6 +463,7 @@ def get_provider(
         return OpenAIProvider(
             api_key=api_key,
             model=kwargs.get("model", "gpt-4o-mini"),
+            **common,
         )
     elif provider_type == "anthropic":
         api_key = kwargs.get("api_key")
@@ -461,6 +472,7 @@ def get_provider(
         return AnthropicProvider(
             api_key=api_key,
             model=kwargs.get("model", "claude-sonnet-4-20250514"),
+            **common,
         )
     else:
         raise ValueError(f"Unknown provider: {provider_type}")

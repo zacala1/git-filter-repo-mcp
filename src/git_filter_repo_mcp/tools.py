@@ -22,7 +22,7 @@ class AnalyzeHistoryInput(BaseModel):
 
     repo_path: str = Field(description="Path to the git repository")
     branch: str = Field(default="HEAD", description="Branch to analyze")
-    max_count: int = Field(default=100, description="Maximum number of commits to analyze")
+    max_count: int = Field(default=100, gt=0, le=10000, description="Maximum number of commits to analyze")
 
 
 class RewriteCommitMessagesInput(BaseModel):
@@ -35,9 +35,9 @@ class RewriteCommitMessagesInput(BaseModel):
         description="Message style: conventional, gitmoji, simple, or detailed",
     )
     dry_run: bool = Field(default=True, description="If true, only show what would be changed")
-    use_ai: bool = Field(default=True, description="Use AI to generate new messages")
-    ai_provider: str = Field(default="ollama", description="AI provider: ollama, openai, or anthropic")
-    ai_model: str = Field(default="llama3.2", description="AI model to use")
+    use_ai: bool = Field(default=False, description="Use AI to generate new messages")
+    ai_provider: str | None = Field(default=None, description="AI provider: ollama, openai, or anthropic (uses config default if not set)")
+    ai_model: str | None = Field(default=None, description="AI model to use (uses config default if not set)")
     manual_mappings: dict[str, str] | None = Field(
         default=None, description="Manual message mappings: {old_message: new_message}"
     )
@@ -66,7 +66,7 @@ class RemoveLargeFilesInput(BaseModel):
 
     repo_path: str = Field(description="Path to the git repository")
     size_threshold_mb: float = Field(
-        default=10.0, description="Size threshold in MB - files larger than this will be removed"
+        default=10.0, gt=0.0, description="Size threshold in MB - files larger than this will be removed"
     )
     dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
@@ -113,8 +113,8 @@ class RewriteSingleCommitInput(BaseModel):
     new_author_name: str | None = Field(default=None, description="New author name")
     new_author_email: str | None = Field(default=None, description="New author email")
     use_ai: bool = Field(default=False, description="Use AI to generate message if not provided")
-    ai_provider: str = Field(default="ollama", description="AI provider: ollama, openai, or anthropic")
-    ai_model: str = Field(default="llama3.2", description="AI model to use")
+    ai_provider: str | None = Field(default=None, description="AI provider: ollama, openai, or anthropic (uses config default if not set)")
+    ai_model: str | None = Field(default=None, description="AI model to use (uses config default if not set)")
     dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
@@ -123,7 +123,7 @@ class ScanSecretsInput(BaseModel):
 
     repo_path: str = Field(description="Path to the git repository")
     branch: str = Field(default="HEAD", description="Branch to scan")
-    max_commits: int = Field(default=100, description="Maximum number of commits to scan")
+    max_commits: int = Field(default=100, gt=0, le=10000, description="Maximum number of commits to scan")
 
 
 class SquashCommitsInput(BaseModel):
