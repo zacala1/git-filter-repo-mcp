@@ -55,6 +55,7 @@ class AIProvider(Protocol):
     """AI provider interface."""
 
     async def generate_message(self, context: CommitContext, style: MessageStyle) -> str: ...
+    async def close(self) -> None: ...
 
 
 STYLE_INSTRUCTIONS = {
@@ -258,12 +259,14 @@ class OpenAIProvider(BaseProvider):
         self,
         api_key: str,
         model: str = "gpt-4o-mini",
+        base_url: str = "https://api.openai.com/v1",
         raise_on_error: bool = True,
         temperature: float = DEFAULT_TEMPERATURE,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ):
         super().__init__(model, raise_on_error, temperature, max_tokens)
         self.api_key = api_key
+        self.base_url = base_url
         self.client = self._create_client()
 
     def _create_client(self) -> httpx.AsyncClient:
@@ -274,19 +277,19 @@ class OpenAIProvider(BaseProvider):
 
     async def check_connection(self) -> tuple[bool, str]:
         try:
-            response = await self.client.get("https://api.openai.com/v1/models", timeout=5.0)
+            response = await self.client.get(f"{self.base_url}/models", timeout=5.0)
             if response.status_code == 401:
                 return False, "Invalid API key"
             response.raise_for_status()
             return True, "Connected"
         except httpx.ConnectError:
-            return False, "Cannot connect to OpenAI"
+            return False, f"Cannot connect to OpenAI at {self.base_url}"
         except httpx.HTTPError as e:
             return False, f"OpenAI: {e}"
 
     async def _call_api(self, prompt: str) -> str:
         response = await self.client.post(
-            "https://api.openai.com/v1/chat/completions",
+            f"{self.base_url}/chat/completions",
             json={
                 "model": self.model,
                 "messages": [
@@ -433,7 +436,7 @@ class AICommitEngine:
 
     async def close(self) -> None:
         if hasattr(self.provider, "close"):
-            await self.provider.close()  # type: ignore[union-attr]
+            await self.provider.close()
 
 
 def get_provider(
@@ -463,6 +466,7 @@ def get_provider(
         return OpenAIProvider(
             api_key=api_key,
             model=kwargs.get("model", "gpt-4o-mini"),
+            base_url=kwargs.get("base_url", "https://api.openai.com/v1"),
             **common,
         )
     elif provider_type == "anthropic":

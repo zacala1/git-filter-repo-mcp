@@ -973,6 +973,65 @@ class TestLazyConfig:
             mock_gc.assert_called()
 
 
+class TestAIProviderValidation:
+    """Test that invalid AI provider names are rejected early."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_provider_rejected(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo("abc123", "User", "u@e.com", "User", "u@e.com", "msg", "2024-01-01"),
+            ]
+            mock_adapter.collect_commit_files.return_value = {"abc123": []}
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_commit_messages",
+                {
+                    "repo_path": "/tmp/repo",
+                    "use_ai": True,
+                    "ai_provider": "nonexistent",
+                    "dry_run": True,
+                },
+            )
+            assert result["success"] is False
+            assert "Invalid AI provider" in result["error"] or "nonexistent" in result["error"]
+
+    def test_create_ai_provider_rejects_none(self):
+        from git_filter_repo_mcp.server import _create_ai_provider
+        with pytest.raises(ValueError, match="Invalid AI provider"):
+            _create_ai_provider({}, "none")
+
+
+class TestOpenAIBaseUrlForwarding:
+    """Test that openai_base_url config is forwarded to the provider."""
+
+    def test_openai_base_url_passed(self):
+        from git_filter_repo_mcp.server import _create_ai_provider
+        with patch("git_filter_repo_mcp.server.get_config") as mock_gc, \
+             patch("git_filter_repo_mcp.server.get_provider") as mock_gp:
+            mock_gc.return_value.ai.model = "gpt-4o"
+            mock_gc.return_value.ai.openai_api_key = "sk-test"
+            mock_gc.return_value.ai.openai_base_url = "https://custom.api.com/v1"
+            _create_ai_provider({}, "openai")
+            mock_gp.assert_called_once_with(
+                "openai",
+                model="gpt-4o",
+                api_key="sk-test",
+                base_url="https://custom.api.com/v1",
+            )
+
+
+class TestLoggingReconfigure:
+    """Test that logging can be reconfigured."""
+
+    def test_configure_logging_callable(self):
+        from git_filter_repo_mcp.server import _configure_logging
+        # Should not raise
+        _configure_logging()
+
+
 class TestToolsValidation:
     """Test Pydantic validation constraints on tool inputs."""
 

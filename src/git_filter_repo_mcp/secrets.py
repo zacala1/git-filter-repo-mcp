@@ -221,8 +221,11 @@ def scan_content(
     for pattern in SECRET_PATTERNS:
         for match in pattern.pattern.finditer(content):
             span = (match.start(), match.end())
-            # Skip if this exact span was already reported or overlaps a previous one
-            if any(s[0] <= span[0] < s[1] or s[0] < span[1] <= s[1] for s in seen_spans):
+            # Skip if this span overlaps any previously reported span
+            if any(
+                span[0] < s[1] and span[1] > s[0]
+                for s in seen_spans
+            ):
                 continue
 
             matched_text = match.group(0)
@@ -274,7 +277,7 @@ def get_file_risk_level(file_path: str) -> str:
     high_risk_extensions = [".pem", ".key", ".p12", ".pfx", ".env"]
     medium_risk_extensions = [".json", ".yml", ".yaml", ".xml", ".conf", ".cfg"]
 
-    ext = "." + file_path.rsplit(".", 1)[-1] if "." in file_path else ""
+    ext = Path(file_path).suffix
 
     if ext in high_risk_extensions:
         return "high"

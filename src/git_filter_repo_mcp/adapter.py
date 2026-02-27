@@ -195,7 +195,7 @@ class GitFilterRepoAdapter:
 
     def get_commit_diff(self, commit_hash: str) -> str:
         """Get diff for a commit."""
-        return self._run_git_fast("show", "--stat", commit_hash).stdout or ""
+        return self._run_git("show", "--stat", commit_hash).stdout or ""
 
     def get_commit_files(self, commit_hash: str) -> list[str]:
         """Get files changed in a commit."""
@@ -308,10 +308,10 @@ class GitFilterRepoAdapter:
         """Change author/committer information for commits."""
         # Sanitize inputs before any operation (including dry_run)
         for label, value in [("name", new_name), ("email", new_email), ("old_email", old_email)]:
-            if any(c in value for c in "<>\n\r"):
+            if any(c in value for c in "<>\n\r\t"):
                 return FilterResult(
                     success=False,
-                    message=f"Invalid characters in {label}: angle brackets and newlines are not allowed",
+                    message=f"Invalid characters in {label}: angle brackets, tabs, and newlines are not allowed",
                 )
 
         # Count affected commits
@@ -521,6 +521,12 @@ class GitFilterRepoAdapter:
 
     def restore_backup(self, backup_branch: str) -> FilterResult:
         """Restore from a backup branch."""
+        if not backup_branch.startswith("backup_"):
+            return FilterResult(
+                success=False,
+                message=f"Invalid backup branch: {backup_branch!r}",
+                error="Backup branch name must start with 'backup_'",
+            )
         try:
             # Get current branch
             result = self._run_git("rev-parse", "--abbrev-ref", "HEAD")
@@ -636,7 +642,11 @@ class GitFilterRepoAdapter:
         new_author_email: str | None = None,
         force: bool = True,
     ) -> FilterResult:
-        """Rewrite a single commit's message and/or author in one filter-repo pass."""
+        """Rewrite a single commit's message and/or author in one filter-repo pass.
+
+        Note: When author fields are changed, committer fields are also updated
+        to match, since in most workflows they should be identical.
+        """
         self._validate_commit_hash(commit_hash)
         changes = {}
         if new_message is not None:
@@ -761,6 +771,13 @@ class GitFilterRepoAdapter:
         self, old_text: str, new_text: str, file_pattern: str | None = None, dry_run: bool = True, force: bool = False,
     ) -> FilterResult:
         """Replace text throughout repository history."""
+        if "\n" in old_text or "\n" in new_text:
+            return FilterResult(
+                success=False,
+                message="Text cannot contain newlines",
+                error="Newlines in old_text or new_text would corrupt the expressions file",
+            )
+
         if dry_run:
             # Search git history (not working directory) for affected files — no temp file needed
             try:
@@ -912,6 +929,11 @@ class GitFilterRepoAdapter:
                         if weekend_only and new_dt.weekday() < 5:
                             days_until_saturday = (5 - new_dt.weekday()) % 7 or 7
                             new_dt = new_dt + datetime.timedelta(days=days_until_saturday)
+                        # Re-apply time range so the hour/minute stays in bounds
+                        new_dt = new_dt.replace(hour=hour, minute=minute, second=second)
+                        # Ensure still after prev_timestamp after time adjustment
+                        if new_dt <= prev_timestamp:
+                            new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(1, 10))
                         current_date = new_dt
 
                 found_valid = True

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from git_filter_repo_mcp.adapter import FilterResult, GitFilterRepoAdapter
+from git_filter_repo_mcp.adapter import CommitInfo, FilterResult, GitFilterRepoAdapter
 from tests.conftest import requires_git_filter_repo
 
 
@@ -959,3 +959,136 @@ class TestBackupTimestampUniqueness:
         parts = backup.split("_")
         assert len(parts) == 4  # backup, date, time, microseconds
         assert len(parts[3]) == 6  # microseconds
+
+
+class TestReplaceTextNewlineRejection:
+    """Test that newlines in old_text/new_text are rejected."""
+
+    @requires_git_filter_repo
+    def test_newline_in_old_text_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.replace_text_in_history(
+            old_text="hello\nworld", new_text="replaced", dry_run=True,
+        )
+        assert result.success is False
+        assert "newlines" in result.message.lower()
+
+    @requires_git_filter_repo
+    def test_newline_in_new_text_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.replace_text_in_history(
+            old_text="hello", new_text="re\nplaced", dry_run=True,
+        )
+        assert result.success is False
+        assert "newlines" in result.message.lower()
+
+    @requires_git_filter_repo
+    def test_clean_text_accepted(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.replace_text_in_history(
+            old_text="hello", new_text="world", dry_run=True,
+        )
+        assert result.success is True
+
+    @requires_git_filter_repo
+    def test_replace_text_with_separator_escaped(self, temp_git_repo):
+        """Test that ==> in new_text is escaped properly."""
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.replace_text_in_history(
+            old_text="hello", new_text="a==>b", dry_run=True,
+        )
+        assert result.success is True
+
+
+class TestMailmapTabInjection:
+    """Test that tab characters in mailmap input are rejected."""
+
+    @requires_git_filter_repo
+    def test_tab_in_name_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author(
+            old_email="test@example.com",
+            new_name="Evil\tName",
+            new_email="evil@example.com",
+            dry_run=True,
+        )
+        assert result.success is False
+        assert "Invalid characters" in result.message
+
+
+class TestRestoreBackupValidation:
+    """Test that restore_backup validates branch name prefix."""
+
+    @requires_git_filter_repo
+    def test_non_backup_branch_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.restore_backup("main")
+        assert result.success is False
+        assert "Invalid backup branch" in result.message
+
+    @requires_git_filter_repo
+    def test_backup_branch_accepted(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        backup = adapter.create_backup()
+        result = adapter.restore_backup(backup)
+        assert result.success is True
+
+
+class TestGenerateDateMappings:
+    """Test _generate_date_mappings directly for edge cases."""
+
+    def test_preserve_order_weekend_only(self):
+        """Dates adjusted by preserve_order should still have valid times."""
+        import datetime
+
+        adapter = _make_mock_adapter()
+        # Create commits with unique hashes, close together so preserve_order kicks in
+        commits = [
+            CommitInfo(
+                hash=f"{i:0>40x}",
+                author_name="Test",
+                author_email="t@e.com",
+                committer_name="Test",
+                committer_email="t@e.com",
+                message=f"commit {i}",
+                date="2024-01-06T10:00:00+00:00",  # Saturday
+            )
+            for i in range(5)
+        ]
+        # Use evening time range (19-23) on weekends only
+        result = adapter._generate_date_mappings(
+            commits,
+            start_hour=19, start_min=0, end_hour=23, end_min=0,
+            weekend_only=True, preserve_order=True, start_date=None,
+        )
+        assert isinstance(result, dict)
+        assert len(result) == 5
+
+        prev_ts = None
+        for _hash, (ts, _tz) in result.items():
+            dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+            # Should be on a weekend
+            assert dt.weekday() >= 5, f"Expected weekend, got weekday {dt.weekday()}"
+            # Should maintain order
+            if prev_ts is not None:
+                assert ts > prev_ts, "Order not preserved"
+            prev_ts = ts
+
+    def test_empty_commits_returns_empty(self):
+        adapter = _make_mock_adapter()
+        result = adapter._generate_date_mappings(
+            [], 19, 0, 23, 0, False, True, None,
+        )
+        assert isinstance(result, dict)
+        assert len(result) == 0
+
+    def test_invalid_start_date_returns_error(self):
+        adapter = _make_mock_adapter()
+        commits = [
+            CommitInfo("a" * 40, "T", "t@e.com", "T", "t@e.com", "msg", "2024-01-01T00:00:00+00:00"),
+        ]
+        result = adapter._generate_date_mappings(
+            commits, 19, 0, 23, 0, False, True, "not-a-date",
+        )
+        assert isinstance(result, FilterResult)
+        assert result.success is False

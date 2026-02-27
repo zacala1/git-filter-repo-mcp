@@ -68,10 +68,15 @@ class TestOpenAIProvider:
         provider = OpenAIProvider(api_key="test-key")
         assert provider.api_key == "test-key"
         assert provider.model == "gpt-4o-mini"
+        assert provider.base_url == "https://api.openai.com/v1"
 
     def test_init_custom_model(self):
         provider = OpenAIProvider(api_key="test-key", model="gpt-4")
         assert provider.model == "gpt-4"
+
+    def test_init_custom_base_url(self):
+        provider = OpenAIProvider(api_key="test-key", base_url="https://custom.api.com/v1")
+        assert provider.base_url == "https://custom.api.com/v1"
 
     def test_build_prompt(self):
         context = CommitContext(original_message="test", commit_hash="abc123", files_changed=[])
@@ -135,6 +140,11 @@ class TestGetProvider:
     def test_get_anthropic_provider_no_key(self):
         with pytest.raises(ValueError, match="Anthropic API key required"):
             get_provider("anthropic")
+
+    def test_get_openai_provider_custom_base_url(self):
+        provider = get_provider("openai", api_key="test-key", base_url="https://custom.com/v1")
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.base_url == "https://custom.com/v1"
 
     def test_get_unknown_provider(self):
         with pytest.raises(ValueError, match="Unknown provider"):

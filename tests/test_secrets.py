@@ -93,6 +93,11 @@ class TestRiskLevel:
         assert get_file_risk_level("main.py") == "low"
         assert get_file_risk_level("index.js") == "low"
 
+    def test_dotted_directory_path(self):
+        """File in a dotted directory should use the file's suffix, not the dir's."""
+        assert get_file_risk_level("dir.config/noextfile") == "low"
+        assert get_file_risk_level("dir.env/script.py") == "low"
+
 
 class TestRedaction:
     """Test secret redaction."""

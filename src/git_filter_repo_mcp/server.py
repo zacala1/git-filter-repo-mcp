@@ -35,9 +35,17 @@ from .tools import (
     SquashCommitsInput,
 )
 
-# Logging setup — use get_config() lazily so reload_config() takes effect
-logging.basicConfig(level=getattr(logging, get_config().server.log_level, logging.INFO))
 logger = logging.getLogger(__name__)
+
+
+def _configure_logging() -> None:
+    """Configure logging level from config. Safe to call multiple times."""
+    level = getattr(logging, get_config().server.log_level, logging.INFO)
+    logging.basicConfig(level=level)
+    logging.getLogger().setLevel(level)
+
+
+_configure_logging()
 
 server = Server("git-filter-repo-mcp")
 
@@ -86,15 +94,24 @@ def result_to_dict(result: FilterResult) -> dict:
     }
 
 
+_VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic"}
+
+
 def _create_ai_provider(args: dict, provider_name: str):
     """Create an AI provider from args and config."""
+    if provider_name not in _VALID_AI_PROVIDERS:
+        raise ValueError(
+            f"Invalid AI provider: {provider_name!r}. Must be one of: {', '.join(sorted(_VALID_AI_PROVIDERS))}"
+        )
     cfg = get_config()
     kwargs: dict = {"model": args.get("ai_model") or cfg.ai.model}
     if provider_name == "ollama":
         kwargs["base_url"] = cfg.ai.ollama_base_url
-    elif provider_name in ("openai", "anthropic"):
-        api_keys = {"openai": cfg.ai.openai_api_key, "anthropic": cfg.ai.anthropic_api_key}
-        kwargs["api_key"] = api_keys.get(provider_name)
+    elif provider_name == "openai":
+        kwargs["api_key"] = cfg.ai.openai_api_key
+        kwargs["base_url"] = cfg.ai.openai_base_url
+    elif provider_name == "anthropic":
+        kwargs["api_key"] = cfg.ai.anthropic_api_key
     return get_provider(provider_name, **kwargs)
 
 
