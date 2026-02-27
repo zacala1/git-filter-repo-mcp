@@ -751,3 +751,68 @@ class TestCollectCommitFiles:
         for commit in commits:
             individual = adapter.get_commit_files(commit.hash)
             assert sorted(bulk.get(commit.hash, [])) == sorted(individual)
+
+
+@requires_git_filter_repo
+class TestRemoveLargeFiles:
+    """Test remove_large_files dry-run and real execution."""
+
+    def test_dry_run_no_large_files(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.remove_large_files(size_threshold_mb=10.0, dry_run=True)
+        assert result.success is True
+        assert result.dry_run is True
+        assert result.files_affected == []
+
+    def test_dry_run_finds_large_file(self, temp_git_repo):
+        # Write a file > 1 byte to detect with a very low threshold
+        (temp_git_repo / "big.bin").write_bytes(b"x" * 2048)
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add big file"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        # Threshold of 0.001 MB = ~1KB, so 2KB file should be found
+        result = adapter.remove_large_files(size_threshold_mb=0.001, dry_run=True)
+        assert result.success is True
+        assert result.dry_run is True
+        assert len(result.files_affected) >= 1
+        assert any("big.bin" in f for f in result.files_affected)
+
+    def test_actual_removal(self, temp_git_repo):
+        (temp_git_repo / "huge.bin").write_bytes(b"y" * 4096)
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add huge"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.remove_large_files(size_threshold_mb=0.001, dry_run=False, force=True)
+        assert result.success is True
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        files = adapter2.list_all_files_in_history()
+        assert "huge.bin" not in files
+
+    def test_high_threshold_finds_nothing(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        # 100MB threshold - nothing in test repo that big
+        result = adapter.remove_large_files(size_threshold_mb=100.0, dry_run=False)
+        assert result.success is True
+        assert "No large files found" in result.message
+
+
+@requires_git_filter_repo
+class TestGetCommitDiff:
+    """Test get_commit_diff method."""
+
+    def test_returns_diff_stat(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        diff = adapter.get_commit_diff(commits[0].hash)
+        assert isinstance(diff, str)
+        assert "config.json" in diff
+
+    def test_initial_commit_diff(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        # Initial commit
+        diff = adapter.get_commit_diff(commits[-1].hash)
+        assert "README.md" in diff
