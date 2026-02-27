@@ -816,3 +816,146 @@ class TestGetCommitDiff:
         # Initial commit
         diff = adapter.get_commit_diff(commits[-1].hash)
         assert "README.md" in diff
+
+
+class TestMailmapInjection:
+    """Test that mailmap injection is prevented."""
+
+    @requires_git_filter_repo
+    def test_newline_in_name_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author(
+            old_email="test@example.com",
+            new_name="Evil\nName",
+            new_email="evil@example.com",
+            dry_run=False,
+        )
+        assert result.success is False
+        assert "Invalid characters" in result.message
+
+    @requires_git_filter_repo
+    def test_angle_bracket_in_email_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author(
+            old_email="test@example.com",
+            new_name="Evil",
+            new_email="evil@example.com> <extra@inject.com",
+            dry_run=False,
+        )
+        assert result.success is False
+        assert "Invalid characters" in result.message
+
+    @requires_git_filter_repo
+    def test_sanitization_runs_in_dry_run(self, temp_git_repo):
+        """Sanitization must run even in dry_run mode to catch invalid input early."""
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author(
+            old_email="test@example.com",
+            new_name="Evil\nName",
+            new_email="evil@example.com",
+            dry_run=True,
+        )
+        assert result.success is False
+        assert "Invalid characters" in result.message
+
+    @requires_git_filter_repo
+    def test_clean_inputs_accepted(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author(
+            old_email="test@example.com",
+            new_name="Clean Name",
+            new_email="clean@example.com",
+            dry_run=True,
+        )
+        assert result.success is True
+
+
+class TestPathInjection:
+    """Test that path option injection is prevented."""
+
+    def test_dash_path_rejected(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError, match="must not start with"):
+            adapter._validate_paths(["--commit-callback"])
+
+    def test_empty_path_rejected(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError, match="empty string"):
+            adapter._validate_paths(["valid.py", ""])
+
+    def test_normal_paths_accepted(self):
+        adapter = _make_mock_adapter()
+        adapter._validate_paths(["src/main.py", "README.md", "docs/"])
+
+    @requires_git_filter_repo
+    def test_remove_files_rejects_option_injection(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        with pytest.raises(ValueError, match="must not start with"):
+            adapter.remove_files(["--commit-callback", "evil code"], dry_run=True)
+
+    @requires_git_filter_repo
+    def test_filter_paths_rejects_option_injection(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        with pytest.raises(ValueError, match="must not start with"):
+            adapter.filter_paths(include_paths=["--force"], dry_run=True)
+
+
+@requires_git_filter_repo
+class TestSquashEndCommitValidation:
+    """Test squash_commits validates end_commit == HEAD."""
+
+    def test_squash_non_head_end_commit_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        # start=initial, end=middle (not HEAD)
+        result = adapter.squash_commits(
+            start_commit=commits[2].hash,
+            end_commit=commits[1].hash,
+            dry_run=False,
+        )
+        assert result.success is False
+        assert "must be HEAD" in result.message
+
+    def test_squash_head_end_commit_accepted_dry_run(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        result = adapter.squash_commits(
+            start_commit=commits[2].hash,
+            end_commit="HEAD",
+            dry_run=True,
+        )
+        assert result.success is True
+
+    def test_squash_zero_range_message(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        result = adapter.squash_commits(
+            start_commit=commits[0].hash,
+            end_commit="HEAD",
+            dry_run=True,
+        )
+        assert result.success is False
+        assert "No commits in range" in result.message
+
+
+@requires_git_filter_repo
+class TestRemoveLargeFilesEmptyRepo:
+    """Test remove_large_files on empty repo."""
+
+    def test_empty_repo_returns_gracefully(self, empty_git_repo):
+        adapter = GitFilterRepoAdapter(str(empty_git_repo))
+        result = adapter.remove_large_files(dry_run=True)
+        assert result.success is True
+
+
+class TestBackupTimestampUniqueness:
+    """Test that backup branch names include microseconds."""
+
+    @requires_git_filter_repo
+    def test_backup_includes_microseconds(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        backup = adapter.create_backup()
+        # Format: backup_YYYYMMDD_HHMMSS_ffffff
+        parts = backup.split("_")
+        assert len(parts) == 4  # backup, date, time, microseconds
+        assert len(parts[3]) == 6  # microseconds

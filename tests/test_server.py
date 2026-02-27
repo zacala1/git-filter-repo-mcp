@@ -696,8 +696,8 @@ class TestSquashCommitsHandler:
     @pytest.mark.asyncio
     async def test_with_auto_backup(self):
         with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server.config") as mock_config:
-            mock_config.server.auto_backup = True
+             patch("git_filter_repo_mcp.server.get_config") as mock_get_config:
+            mock_get_config.return_value.server.auto_backup = True
             mock_adapter = MagicMock()
             mock_adapter.create_backup.return_value = "backup_squash"
             mock_adapter.squash_commits.return_value = FilterResult(
@@ -858,3 +858,155 @@ class TestAIRewriteUsesBulkFiles:
                     mock_commits, "HEAD", 2,
                 )
                 mock_adapter.get_commit_files.assert_not_called()
+
+
+class TestPartialAuthorValidation:
+    """Test that partial author info (only name or only email) is rejected."""
+
+    @pytest.mark.asyncio
+    async def test_only_name_rejected(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo("abc123", "User", "u@e.com", "User", "u@e.com", "msg", "2024-01-01"),
+            ]
+            mock_adapter._validate_commit_hash = MagicMock()
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_single_commit",
+                {
+                    "repo_path": "/tmp/repo",
+                    "commit_hash": "abc123",
+                    "new_author_name": "New Name",
+                    # new_author_email is missing
+                    "dry_run": False,
+                },
+            )
+            assert result["success"] is False
+            assert "new_author_email" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_only_email_rejected(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo("abc123", "User", "u@e.com", "User", "u@e.com", "msg", "2024-01-01"),
+            ]
+            mock_adapter._validate_commit_hash = MagicMock()
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_single_commit",
+                {
+                    "repo_path": "/tmp/repo",
+                    "commit_hash": "abc123",
+                    "new_author_email": "new@example.com",
+                    # new_author_name is missing
+                    "dry_run": False,
+                },
+            )
+            assert result["success"] is False
+            assert "new_author_name" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_both_provided_accepted(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo("abc123", "User", "u@e.com", "User", "u@e.com", "msg", "2024-01-01"),
+            ]
+            mock_adapter._validate_commit_hash = MagicMock()
+            mock_adapter.rewrite_single_commit.return_value = FilterResult(
+                success=True, message="Updated abc123: author",
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_single_commit",
+                {
+                    "repo_path": "/tmp/repo",
+                    "commit_hash": "abc123",
+                    "new_author_name": "New Name",
+                    "new_author_email": "new@example.com",
+                    "dry_run": False,
+                },
+            )
+            assert result["success"] is True
+
+
+class TestCommitHashValidationInHandler:
+    """Test that rewrite_single_commit handler validates commit hash early."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_hash_rejected_early(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter._validate_commit_hash.side_effect = ValueError("Invalid commit hash")
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "rewrite_single_commit",
+                {
+                    "repo_path": "/tmp/repo",
+                    "commit_hash": '"; evil code',
+                    "new_message": "test",
+                    "dry_run": False,
+                },
+            )
+            assert result["success"] is False
+            assert "INVALID_INPUT" in str(result.get("error_code", ""))
+
+
+class TestLazyConfig:
+    """Test that server uses get_config() lazily (not module-level snapshot)."""
+
+    @pytest.mark.asyncio
+    async def test_handler_reads_fresh_config(self):
+        """Verify _create_ai_provider calls get_config() each time."""
+        from git_filter_repo_mcp.server import _create_ai_provider
+        with patch("git_filter_repo_mcp.server.get_config") as mock_gc, \
+             patch("git_filter_repo_mcp.server.get_provider") as mock_gp:
+            mock_gc.return_value.ai.model = "test-model"
+            mock_gc.return_value.ai.ollama_base_url = "http://localhost:11434"
+            _create_ai_provider({}, "ollama")
+            mock_gc.assert_called()
+
+
+class TestToolsValidation:
+    """Test Pydantic validation constraints on tool inputs."""
+
+    def test_max_count_zero_rejected(self):
+        from git_filter_repo_mcp.tools import AnalyzeHistoryInput
+        with pytest.raises(Exception):
+            AnalyzeHistoryInput(repo_path="/tmp", max_count=0)
+
+    def test_max_count_negative_rejected(self):
+        from git_filter_repo_mcp.tools import AnalyzeHistoryInput
+        with pytest.raises(Exception):
+            AnalyzeHistoryInput(repo_path="/tmp", max_count=-1)
+
+    def test_max_count_over_limit_rejected(self):
+        from git_filter_repo_mcp.tools import AnalyzeHistoryInput
+        with pytest.raises(Exception):
+            AnalyzeHistoryInput(repo_path="/tmp", max_count=20000)
+
+    def test_size_threshold_zero_rejected(self):
+        from git_filter_repo_mcp.tools import RemoveLargeFilesInput
+        with pytest.raises(Exception):
+            RemoveLargeFilesInput(repo_path="/tmp", size_threshold_mb=0.0)
+
+    def test_size_threshold_negative_rejected(self):
+        from git_filter_repo_mcp.tools import RemoveLargeFilesInput
+        with pytest.raises(Exception):
+            RemoveLargeFilesInput(repo_path="/tmp", size_threshold_mb=-5.0)
+
+    def test_use_ai_defaults_false(self):
+        from git_filter_repo_mcp.tools import RewriteCommitMessagesInput
+        params = RewriteCommitMessagesInput(repo_path="/tmp")
+        assert params.use_ai is False
+
+    def test_ai_provider_defaults_none(self):
+        from git_filter_repo_mcp.tools import RewriteCommitMessagesInput
+        params = RewriteCommitMessagesInput(repo_path="/tmp")
+        assert params.ai_provider is None
