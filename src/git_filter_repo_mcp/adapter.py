@@ -277,19 +277,31 @@ class GitFilterRepoAdapter:
                 dry_run=True,
             )
 
-        replacements = {old: new for _, old, new in rewrites}
-        encoded = self._encode_callback_data(replacements)
+        # Build both message-based and hash-based lookup tables.
+        # Hash-based takes priority to handle duplicate commit messages correctly.
+        msg_replacements = {old: new for _, old, new in rewrites}
+        hash_replacements = {h: new for h, _, new in rewrites}
+        encoded_msgs = self._encode_callback_data(msg_replacements)
+        encoded_hashes = self._encode_callback_data(hash_replacements)
 
-        # git-filter-repo exec's this with `message` (bytes) in scope
+        # git-filter-repo exec's this with `message` and `commit` in scope
+        # --commit-callback gives us commit.original_id for hash-based lookup
         callback_code = (
-            self._callback_preamble(encoded, '_REPLACEMENTS') +
-            '_msg_str = message.decode("utf-8") if isinstance(message, bytes) else message\n'
-            '_new_msg = _REPLACEMENTS.get(_msg_str.strip(), _msg_str)\n'
-            'return _new_msg.encode("utf-8") if isinstance(message, bytes) else _new_msg'
+            self._callback_preamble(encoded_hashes, '_HASH_MAP') +
+            f'_MSG_MAP = __import__("json").loads(__import__("base64").b64decode("{encoded_msgs}").decode())\n'
+            '_orig_id = commit.original_id.decode() if commit.original_id else None\n'
+            '_msg_str = commit.message.decode("utf-8") if isinstance(commit.message, bytes) else commit.message\n'
+            '_new_msg = None\n'
+            'if _orig_id and _orig_id in _HASH_MAP:\n'
+            '    _new_msg = _HASH_MAP[_orig_id]\n'
+            'elif _msg_str.strip() in _MSG_MAP:\n'
+            '    _new_msg = _MSG_MAP[_msg_str.strip()]\n'
+            'if _new_msg is not None:\n'
+            '    commit.message = _new_msg.encode("utf-8")'
         )
 
         result = self._run_filter_repo(
-            "--message-callback",
+            "--commit-callback",
             callback_code,
             dry_run=False,
             force=force,
@@ -724,6 +736,7 @@ class GitFilterRepoAdapter:
 
     def get_file_history(self, file_path: str) -> list[dict]:
         """Get commit history for a specific file."""
+        self._validate_ref(file_path)
         sep = self._FIELD_SEP
         history = []
         for line in _parse_lines(self._run_git("log", "--follow", f"--format=%H{sep}%an{sep}%ae{sep}%s{sep}%aI", "--", file_path).stdout):
@@ -732,6 +745,12 @@ class GitFilterRepoAdapter:
                 history.append({"hash": parts[0][:8], "author": f"{parts[1]} <{parts[2]}>", "message": parts[3], "date": parts[4]})
         return history
 
+    @staticmethod
+    def _validate_ref(ref: str) -> None:
+        """Validate a git ref is safe (not an option injection)."""
+        if ref.startswith("-"):
+            raise ValueError(f"Invalid ref (must not start with '-'): {ref!r}")
+
     def squash_commits(self, start_commit: str, end_commit: str = "HEAD", new_message: str | None = None, dry_run: bool = True) -> FilterResult:
         """Squash commits between start_commit (exclusive) and end_commit (inclusive).
 
@@ -739,6 +758,8 @@ class GitFilterRepoAdapter:
         to the current HEAD.  If end_commit is not HEAD the operation is
         rejected to avoid silent data loss.
         """
+        self._validate_ref(start_commit)
+        self._validate_ref(end_commit)
         try:
             commit_count = _safe_int(self._run_git("rev-list", "--count", f"{start_commit}..{end_commit}").stdout)
         except subprocess.CalledProcessError:
@@ -769,7 +790,12 @@ class GitFilterRepoAdapter:
                 new_message = "Squashed commits:\n" + "\n".join(f"- {m}" for m in messages) if messages else "Squashed commits"
 
             self._run_git("reset", "--soft", start_commit)
-            self._run_git("commit", "-m", new_message)
+            try:
+                self._run_git("commit", "-m", new_message)
+            except subprocess.CalledProcessError:
+                # Commit failed after reset — restore HEAD to avoid leaving dirty state
+                self._run_git("reset", "--soft", head_hash)
+                return FilterResult(success=False, message="Failed to create squash commit; HEAD restored", error="git commit failed after reset --soft")
             return FilterResult(success=True, message=f"Squashed {commit_count} commits", commits_processed=commit_count, commits_rewritten=1)
         except subprocess.CalledProcessError as e:
             return FilterResult(success=False, message="Failed to squash", error=str(e))
@@ -778,6 +804,8 @@ class GitFilterRepoAdapter:
         self, old_text: str, new_text: str, file_pattern: str | None = None, dry_run: bool = True, force: bool = False,
     ) -> FilterResult:
         """Replace text throughout repository history."""
+        if not old_text:
+            return FilterResult(success=False, message="old_text must not be empty")
         if "\n" in old_text or "\n" in new_text:
             return FilterResult(
                 success=False,

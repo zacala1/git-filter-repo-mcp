@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import subprocess
 from functools import wraps
 from typing import Any, Callable
 
@@ -72,6 +73,9 @@ def tool_handler(name: str):
                 return {"success": False, "error": msg, "error_code": code}
             except RuntimeError as e:
                 return {"success": False, "error": str(e), "error_code": ErrorCode.COMMAND_FAILED}
+            except subprocess.TimeoutExpired as e:
+                logger.warning("%s timed out: %s", name, e)
+                return {"success": False, "error": f"Operation timed out ({e.timeout}s)", "error_code": ErrorCode.COMMAND_FAILED}
             except Exception as e:
                 logger.exception("%s failed", name)
                 return {"success": False, "error": f"Internal error: {type(e).__name__}", "error_code": ErrorCode.INTERNAL_ERROR}

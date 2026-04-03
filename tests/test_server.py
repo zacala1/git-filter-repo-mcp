@@ -1148,3 +1148,51 @@ class TestBackupBeforeDestructiveOps:
 
             mock_adapter.create_backup.assert_not_called()
             assert "backup_branch" not in result
+
+
+class TestTimeoutHandling:
+    """Test that subprocess timeouts return structured errors, not crashes."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_error(self):
+        import subprocess as sp
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            MockAdapter.side_effect = sp.TimeoutExpired("git", 30)
+
+            result = await _execute_tool("analyze_git_history", {"repo_path": "/tmp/repo"})
+            assert result["success"] is False
+            assert "timed out" in result["error"]
+            assert result["error_code"] == ErrorCode.COMMAND_FAILED
+
+
+class TestSquashInjection:
+    """Test that squash_commits rejects dash-prefixed refs."""
+
+    @pytest.mark.asyncio
+    async def test_dash_start_commit_rejected(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.squash_commits.side_effect = ValueError("Invalid ref")
+            MockAdapter.return_value = mock_adapter
+            result = await _execute_tool("squash_commits", {
+                "repo_path": "/tmp/repo", "start_commit": "--exec=evil", "dry_run": True,
+            })
+            assert result["success"] is False
+
+
+class TestReplaceTextValidation:
+    """Test replace_text input validation."""
+
+    @pytest.mark.asyncio
+    async def test_empty_old_text_rejected(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.replace_text_in_history.return_value = FilterResult(
+                success=False, message="old_text must not be empty",
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool("replace_text_in_history", {
+                "repo_path": "/tmp/repo", "old_text": "", "new_text": "x", "dry_run": True,
+            })
+            assert result["success"] is False
