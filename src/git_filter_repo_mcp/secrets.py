@@ -17,7 +17,6 @@ class SecretPattern:
     severity: str = "high"  # high, medium, low
 
 
-# Common secret patterns
 SECRET_PATTERNS: list[SecretPattern] = [
     SecretPattern(
         name="aws_access_key",
@@ -138,7 +137,6 @@ SECRET_PATTERNS: list[SecretPattern] = [
     ),
 ]
 
-# Files commonly containing secrets
 SENSITIVE_FILES = [
     ".env",
     ".env.local",
@@ -214,14 +212,11 @@ def scan_content(
         return []
 
     findings = []
-    # Deduplicate by (line_number, match_span) to avoid reporting the same
-    # text region under multiple overlapping patterns.
     seen_spans: set[tuple[int, int]] = set()
 
     for pattern in SECRET_PATTERNS:
         for match in pattern.pattern.finditer(content):
             span = (match.start(), match.end())
-            # Skip if this span overlaps any previously reported span
             if any(
                 span[0] < s[1] and span[1] > s[0]
                 for s in seen_spans
@@ -229,11 +224,8 @@ def scan_content(
                 continue
 
             matched_text = match.group(0)
-
-            # Get line number
             line_number = content[: match.start()].count("\n") + 1
 
-            # Get context (surrounding text)
             start = max(0, match.start() - 20)
             end = min(len(content), match.end() + 20)
             context = content[start:end].replace("\n", " ")
@@ -268,20 +260,19 @@ def is_sensitive_file(file_path: str) -> bool:
     return False
 
 
+_HIGH_RISK_EXTENSIONS = frozenset({".pem", ".key", ".p12", ".pfx", ".env"})
+_MEDIUM_RISK_EXTENSIONS = frozenset({".json", ".yml", ".yaml", ".xml", ".conf", ".cfg"})
+
+
 def get_file_risk_level(file_path: str) -> str:
     """Get risk level for a file path."""
     if is_sensitive_file(file_path):
         return "high"
 
-    # Check extensions
-    high_risk_extensions = [".pem", ".key", ".p12", ".pfx", ".env"]
-    medium_risk_extensions = [".json", ".yml", ".yaml", ".xml", ".conf", ".cfg"]
-
     ext = Path(file_path).suffix
-
-    if ext in high_risk_extensions:
+    if ext in _HIGH_RISK_EXTENSIONS:
         return "high"
-    if ext in medium_risk_extensions:
+    if ext in _MEDIUM_RISK_EXTENSIONS:
         return "medium"
 
     return "low"

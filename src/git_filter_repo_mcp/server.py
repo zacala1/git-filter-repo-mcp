@@ -49,7 +49,6 @@ _configure_logging()
 
 server = Server("git-filter-repo-mcp")
 
-# Tool handler registry
 _HANDLERS: dict[str, Callable] = {}
 
 
@@ -63,7 +62,7 @@ def tool_handler(name: str):
             except ValidationError as e:
                 errors = e.errors()
                 details = "; ".join(
-                    f"{'.'.join(str(l) for l in err['loc'])}: {err['msg']}"
+                    f"{'.'.join(str(part) for part in err['loc'])}: {err['msg']}"
                     for err in errors
                 )
                 return {"success": False, "error": f"Invalid input: {details}", "error_code": ErrorCode.INVALID_INPUT}
@@ -94,6 +93,13 @@ def result_to_dict(result: FilterResult) -> dict:
     }
 
 
+def _maybe_backup(adapter: GitFilterRepoAdapter, dry_run: bool) -> str | None:
+    """Create a backup branch before a destructive operation, if configured."""
+    if get_config().server.auto_backup and not dry_run:
+        return adapter.create_backup()
+    return None
+
+
 _VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic"}
 
 
@@ -117,15 +123,14 @@ def _create_ai_provider(args: dict, provider_name: str):
 
 async def _check_ai_connection(provider, provider_name: str) -> dict | None:
     """Check AI connection, return error dict if failed, None if ok."""
-    if hasattr(provider, "check_connection"):
-        connected, status = await provider.check_connection()
-        if not connected:
-            return {
-                "success": False,
-                "error": f"AI ({provider_name}) connection failed: {status}",
-                "error_code": ErrorCode.AI_CONNECTION_FAILED,
-                "ai_provider": provider_name,
-            }
+    connected, status = await provider.check_connection()
+    if not connected:
+        return {
+            "success": False,
+            "error": f"AI ({provider_name}) connection failed: {status}",
+            "error_code": ErrorCode.AI_CONNECTION_FAILED,
+            "ai_provider": provider_name,
+        }
     return None
 
 
@@ -192,6 +197,7 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                     "ai_provider": ai_provider_name,
                 }
 
+            backup = _maybe_backup(adapter, dry_run)
             rewrite_by_hash = {r["hash"]: r["new"] for r in rewrites}
 
             def sync_callback(msg: str, commit_hash: str) -> str:
@@ -201,7 +207,10 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                 adapter.rewrite_commit_messages,
                 sync_callback, branch=params.branch, dry_run=False, force=True,
             )
-            return result_to_dict(result)
+            response = result_to_dict(result)
+            if backup:
+                response["backup_branch"] = backup
+            return response
         except AIConnectionError as e:
             return {"success": False, "error": str(e), "error_code": ErrorCode.AI_CONNECTION_FAILED, "ai_provider": ai_provider_name}
         finally:
@@ -213,11 +222,15 @@ async def _handle_rewrite_messages(args: dict) -> dict:
         def callback(msg: str, _: str) -> str:
             return mappings.get(msg, msg)
 
+        backup = _maybe_backup(adapter, dry_run)
         result = await asyncio.to_thread(
             adapter.rewrite_commit_messages,
             callback, branch=params.branch, dry_run=dry_run, force=not dry_run,
         )
-        return result_to_dict(result)
+        response = result_to_dict(result)
+        if backup:
+            response["backup_branch"] = backup
+        return response
 
     else:
         return {"success": False, "error": "Either use_ai or manual_mappings must be provided", "error_code": ErrorCode.INVALID_INPUT}
@@ -229,9 +242,12 @@ async def _handle_change_author(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        return result_to_dict(
-            adapter.change_author(params.old_email, params.new_name, params.new_email, params.dry_run, not params.dry_run)
-        )
+        backup = _maybe_backup(adapter, params.dry_run)
+        result = adapter.change_author(params.old_email, params.new_name, params.new_email, params.dry_run, not params.dry_run)
+        response = result_to_dict(result)
+        if backup:
+            response["backup_branch"] = backup
+        return response
 
     return await asyncio.to_thread(_run)
 
@@ -242,7 +258,12 @@ async def _handle_remove_files(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        return result_to_dict(adapter.remove_files(params.paths, params.dry_run, not params.dry_run))
+        backup = _maybe_backup(adapter, params.dry_run)
+        result = adapter.remove_files(params.paths, params.dry_run, not params.dry_run)
+        response = result_to_dict(result)
+        if backup:
+            response["backup_branch"] = backup
+        return response
 
     return await asyncio.to_thread(_run)
 
@@ -253,7 +274,12 @@ async def _handle_remove_large_files(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        return result_to_dict(adapter.remove_large_files(params.size_threshold_mb, params.dry_run, not params.dry_run))
+        backup = _maybe_backup(adapter, params.dry_run)
+        result = adapter.remove_large_files(params.size_threshold_mb, params.dry_run, not params.dry_run)
+        response = result_to_dict(result)
+        if backup:
+            response["backup_branch"] = backup
+        return response
 
     return await asyncio.to_thread(_run)
 
@@ -264,9 +290,12 @@ async def _handle_filter_paths(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        return result_to_dict(
-            adapter.filter_paths(params.include_paths, params.exclude_paths, params.dry_run, not params.dry_run)
-        )
+        backup = _maybe_backup(adapter, params.dry_run)
+        result = adapter.filter_paths(params.include_paths, params.exclude_paths, params.dry_run, not params.dry_run)
+        response = result_to_dict(result)
+        if backup:
+            response["backup_branch"] = backup
+        return response
 
     return await asyncio.to_thread(_run)
 
@@ -295,6 +324,8 @@ async def _handle_restore_backup(args: dict) -> dict:
 @tool_handler("get_commit_details")
 async def _handle_get_commit_details(args: dict) -> dict:
     params = GetCommitDetailsInput(**args)
+    if params.commit_hash.startswith("-"):
+        return {"success": False, "error": "Invalid commit hash", "error_code": ErrorCode.INVALID_INPUT}
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
@@ -381,6 +412,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
             "new_author_email": params.new_author_email,
         }
 
+    backup = _maybe_backup(adapter, params.dry_run)
     result = await asyncio.to_thread(
         adapter.rewrite_single_commit,
         commit_hash,
@@ -388,7 +420,10 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         new_author_name=params.new_author_name if has_author_change else None,
         new_author_email=params.new_author_email if has_author_change else None,
     )
-    return result_to_dict(result)
+    response = result_to_dict(result)
+    if backup:
+        response["backup_branch"] = backup
+    return response
 
 
 @tool_handler("scan_secrets")
@@ -407,7 +442,7 @@ async def _handle_squash_commits(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = adapter.create_backup() if get_config().server.auto_backup and not params.dry_run else None
+        backup = _maybe_backup(adapter, params.dry_run)
         result = adapter.squash_commits(params.start_commit, params.end_commit, params.new_message, params.dry_run)
         response = result_to_dict(result)
         if backup:
@@ -423,7 +458,7 @@ async def _handle_replace_text(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = adapter.create_backup() if get_config().server.auto_backup and not params.dry_run else None
+        backup = _maybe_backup(adapter, params.dry_run)
         result = adapter.replace_text_in_history(
             params.old_text, params.new_text, params.file_pattern, params.dry_run, not params.dry_run,
         )
@@ -463,7 +498,7 @@ async def _handle_change_dates(args: dict) -> dict:
 
     def _run():
         adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = adapter.create_backup() if get_config().server.auto_backup and not params.dry_run else None
+        backup = _maybe_backup(adapter, params.dry_run)
         result = adapter.change_commit_dates(
             params.time_range, params.weekend_only, params.preserve_order,
             params.start_date, dry_run=params.dry_run, force=not params.dry_run,
@@ -519,7 +554,7 @@ async def run_server():
                 write_stream,
                 server.create_initialization_options(),
             )
-    except Exception as e:
+    except Exception:
         logger.exception("server error")
         raise
 

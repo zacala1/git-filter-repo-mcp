@@ -1092,3 +1092,64 @@ class TestGenerateDateMappings:
         )
         assert isinstance(result, FilterResult)
         assert result.success is False
+
+
+class TestRestoreBackupBranchValidation:
+    """Test restore_backup with stricter regex validation."""
+
+    @requires_git_filter_repo
+    def test_injection_attempt_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.restore_backup("backup_; rm -rf /")
+        assert result.success is False
+        assert "Invalid backup branch" in result.message
+
+    @requires_git_filter_repo
+    def test_nonexistent_backup_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.restore_backup("backup_99991231_235959_000000")
+        assert result.success is False
+
+    @requires_git_filter_repo
+    def test_hyphens_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.restore_backup("backup_2024-01-01")
+        assert result.success is False
+
+
+class TestAnalyzeHistoryResponse:
+    """Test that analyze_history includes all expected fields."""
+
+    @requires_git_filter_repo
+    def test_total_authors_present(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.analyze_history()
+        assert "total_authors" in result
+        assert result["total_authors"] == 1
+
+    @requires_git_filter_repo
+    def test_total_commits_matches(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.analyze_history()
+        assert result["total_commits"] == 3
+
+
+class TestScanSecretsSensitiveDedup:
+    """Test that sensitive files are not duplicated across commits."""
+
+    @requires_git_filter_repo
+    def test_sensitive_file_in_multiple_commits_deduplicated(self, temp_git_repo):
+        import subprocess
+        # Create .env in two commits
+        (temp_git_repo / ".env").write_text("SECRET=abc")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add env"], cwd=temp_git_repo, capture_output=True)
+        (temp_git_repo / ".env").write_text("SECRET=def")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "update env"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.scan_secrets()
+        # .env should appear only once in sensitive_file_list
+        env_entries = [f for f in result["sensitive_file_list"] if f["file"] == ".env"]
+        assert len(env_entries) == 1

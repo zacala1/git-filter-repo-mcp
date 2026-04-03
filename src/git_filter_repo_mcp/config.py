@@ -56,7 +56,6 @@ def load_config() -> Config:
     """
     config = Config()
 
-    # Load from config files
     config_paths = [
         Path("./config.json"),
         Path.home() / ".config" / "git-filter-repo-mcp" / "config.json",
@@ -73,7 +72,6 @@ def load_config() -> Config:
             except IOError as e:
                 logger.warning("Failed to read config file %s: %s", config_path, e)
 
-    # Override with environment variables (highest priority)
     _apply_env_vars(config)
 
     return config
@@ -108,7 +106,6 @@ def _apply_config_dict(config: Config, data: dict) -> None:
 
 def _apply_env_vars(config: Config) -> None:
     """Apply environment variables to config."""
-    # AI settings
     if provider := os.getenv("GIT_FILTER_REPO_AI_PROVIDER"):
         config.ai.provider = provider  # type: ignore[assignment]
 
@@ -127,7 +124,6 @@ def _apply_env_vars(config: Config) -> None:
     if anthropic_key := os.getenv("ANTHROPIC_API_KEY"):
         config.ai.anthropic_api_key = anthropic_key
 
-    # Server settings
     if log_level := os.getenv("GIT_FILTER_REPO_LOG_LEVEL"):
         config.server.log_level = log_level
 

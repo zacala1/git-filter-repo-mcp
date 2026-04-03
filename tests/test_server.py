@@ -843,7 +843,7 @@ class TestAIRewriteUsesBulkFiles:
             with patch("git_filter_repo_mcp.server.AICommitEngine", return_value=mock_engine):
                 mock_create.return_value = mock_provider
 
-                result = await _execute_tool(
+                await _execute_tool(
                     "rewrite_commit_messages",
                     {
                         "repo_path": "/tmp/repo",
@@ -966,7 +966,7 @@ class TestLazyConfig:
         """Verify _create_ai_provider calls get_config() each time."""
         from git_filter_repo_mcp.server import _create_ai_provider
         with patch("git_filter_repo_mcp.server.get_config") as mock_gc, \
-             patch("git_filter_repo_mcp.server.get_provider") as mock_gp:
+             patch("git_filter_repo_mcp.server.get_provider"):
             mock_gc.return_value.ai.model = "test-model"
             mock_gc.return_value.ai.ollama_base_url = "http://localhost:11434"
             _create_ai_provider({}, "ollama")
@@ -1069,3 +1069,82 @@ class TestToolsValidation:
         from git_filter_repo_mcp.tools import RewriteCommitMessagesInput
         params = RewriteCommitMessagesInput(repo_path="/tmp")
         assert params.ai_provider is None
+
+
+class TestGetCommitDetailsInjection:
+    """Test that get_commit_details rejects dash-prefixed hashes."""
+
+    @pytest.mark.asyncio
+    async def test_dash_hash_rejected(self):
+        result = await _execute_tool(
+            "get_commit_details",
+            {"repo_path": "/tmp/repo", "commit_hash": "--exec=evil"},
+        )
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+
+    @pytest.mark.asyncio
+    async def test_normal_hash_accepted(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo("abc123", "U", "u@e", "U", "u@e", "msg", "2024-01-01")
+            ]
+            mock_adapter.get_commit_files.return_value = []
+            mock_adapter.get_commit_diff.return_value = ""
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool(
+                "get_commit_details",
+                {"repo_path": "/tmp/repo", "commit_hash": "abc123"},
+            )
+            assert result["success"] is True
+
+
+class TestBackupBeforeDestructiveOps:
+    """Test that backup is created BEFORE destructive operations."""
+
+    @pytest.mark.asyncio
+    async def test_change_author_backup_before_operation(self):
+        """Verify create_backup is called before change_author."""
+        call_order = []
+
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
+             patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.auto_backup = True
+            mock_adapter = MagicMock()
+
+            def track_backup():
+                call_order.append("backup")
+                return "backup_test"
+            mock_adapter.create_backup.side_effect = track_backup
+
+            def track_change(*a, **kw):
+                call_order.append("change_author")
+                return FilterResult(success=True, message="done")
+            mock_adapter.change_author.side_effect = track_change
+            MockAdapter.return_value = mock_adapter
+
+            await _execute_tool("change_author", {
+                "repo_path": "/tmp/repo", "old_email": "a@b",
+                "new_name": "N", "new_email": "n@b", "dry_run": False,
+            })
+
+            assert call_order == ["backup", "change_author"]
+
+    @pytest.mark.asyncio
+    async def test_no_backup_on_dry_run(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
+             patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.auto_backup = True
+            mock_adapter = MagicMock()
+            mock_adapter.change_author.return_value = FilterResult(success=True, message="dry", dry_run=True)
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool("change_author", {
+                "repo_path": "/tmp/repo", "old_email": "a@b",
+                "new_name": "N", "new_email": "n@b", "dry_run": True,
+            })
+
+            mock_adapter.create_backup.assert_not_called()
+            assert "backup_branch" not in result

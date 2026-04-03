@@ -13,7 +13,6 @@ from git_filter_repo_mcp.config import (
     _apply_env_vars,
     create_default_config_file,
     get_config,
-    load_config,
     reload_config,
 )
 
@@ -135,7 +134,6 @@ class TestLoadConfig:
             }))
             with patch("git_filter_repo_mcp.config.Path") as MockPath:
                 # Mock so only our temp config is found
-                mock_local = type(MockPath.return_value)
                 MockPath.side_effect = lambda p: config_path if p == "./config.json" else Path(p)
                 # Simpler approach: just test _apply_config_dict via load_config indirectly
                 config = Config()

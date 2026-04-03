@@ -126,10 +126,14 @@ Original commit message: "{context.original_message}"
 Respond with ONLY the new commit message, nothing else. Do not include quotes around the message."""
 
 
-# Default AI generation parameters
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_TOP_P = 0.9
 DEFAULT_MAX_TOKENS = 200
+
+_CONVENTIONAL_PREFIXES = (
+    "feat:", "fix:", "docs:", "style:", "refactor:",
+    "test:", "chore:", "perf:", "ci:", "build:", "revert:",
+)
 
 
 class BaseProvider(ABC):
@@ -188,18 +192,13 @@ class BaseProvider(ABC):
         message = response.strip().strip("\"'")
 
         if style == MessageStyle.CONVENTIONAL:
-            valid_prefixes = [
-                "feat:", "fix:", "docs:", "style:", "refactor:",
-                "test:", "chore:", "perf:", "ci:", "build:", "revert:",
-            ]
-            if not any(message.lower().startswith(p) for p in valid_prefixes):
+            if not any(message.lower().startswith(p) for p in _CONVENTIONAL_PREFIXES):
                 message = f"chore: {message}"
 
         return message
 
     async def close(self) -> None:
-        if hasattr(self, "client"):
-            await self.client.aclose()
+        await self.client.aclose()
 
 
 class OllamaProvider(BaseProvider):
@@ -435,8 +434,7 @@ class AICommitEngine:
         ))
 
     async def close(self) -> None:
-        if hasattr(self.provider, "close"):
-            await self.provider.close()
+        await self.provider.close()
 
 
 def get_provider(
