@@ -1261,3 +1261,76 @@ class TestScanSecretsEmptyRepo:
             result = await _execute_tool("scan_secrets", {"repo_path": "/tmp/repo"})
             assert result["success"] is True
             assert result["secrets_found"] == 0
+
+
+class TestStyleValidation:
+    """Test that invalid message styles are rejected by Pydantic."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_style_rejected(self):
+        result = await _execute_tool("rewrite_commit_messages", {
+            "repo_path": "/tmp/repo", "use_ai": True, "style": "nonexistent",
+        })
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+
+    @pytest.mark.asyncio
+    async def test_valid_styles_accepted(self):
+        """All four valid styles should pass Pydantic validation."""
+        from git_filter_repo_mcp.tools import RewriteCommitMessagesInput
+        for style in ("conventional", "gitmoji", "simple", "detailed"):
+            params = RewriteCommitMessagesInput(repo_path="/tmp", style=style)
+            assert params.style == style
+
+
+class TestAIProviderNoneRejection:
+    """Test that use_ai=True with provider='none' gives clear error."""
+
+    @pytest.mark.asyncio
+    async def test_rewrite_messages_none_provider_rejected(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
+             patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.ai.provider = "none"
+            MockAdapter.return_value = MagicMock()
+
+            result = await _execute_tool("rewrite_commit_messages", {
+                "repo_path": "/tmp/repo", "use_ai": True, "dry_run": True,
+            })
+            assert result["success"] is False
+            assert "none" in result["error"].lower()
+            assert result["error_code"] == ErrorCode.INVALID_INPUT
+
+    @pytest.mark.asyncio
+    async def test_rewrite_single_none_provider_rejected(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
+             patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.ai.provider = "none"
+            mock_adapter = MagicMock()
+            mock_adapter.get_commits.return_value = [
+                CommitInfo("abc123", "U", "u@e", "U", "u@e", "msg", "2024-01-01")
+            ]
+            mock_adapter._validate_commit_hash = MagicMock()
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool("rewrite_single_commit", {
+                "repo_path": "/tmp/repo", "commit_hash": "abc123",
+                "use_ai": True, "dry_run": False,
+            })
+            assert result["success"] is False
+            assert "none" in result["error"].lower()
+
+
+class TestCalledProcessErrorHandling:
+    """Test that CalledProcessError returns structured error, not 'Internal error'."""
+
+    @pytest.mark.asyncio
+    async def test_called_process_error_structured(self):
+        import subprocess as sp
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            MockAdapter.side_effect = sp.CalledProcessError(128, ["git", "log"], stderr="fatal: bad ref")
+
+            result = await _execute_tool("analyze_git_history", {"repo_path": "/tmp/repo"})
+            assert result["success"] is False
+            assert result["error_code"] == ErrorCode.COMMAND_FAILED
+            assert "Command failed" in result["error"]
+            assert "Internal error" not in result["error"]

@@ -89,7 +89,7 @@ def tool_handler(name: str):
 
 
 def result_to_dict(result: FilterResult) -> dict:
-    """FilterResult -> dict"""
+    """Convert a FilterResult dataclass to a JSON-serializable dict."""
     return {
         "success": result.success,
         "message": result.message,
@@ -112,7 +112,10 @@ _VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic"}
 
 
 def _create_ai_provider(args: dict, provider_name: str):
-    """Create an AI provider from args and config."""
+    """Create an AI provider instance from tool args and global config.
+
+    Raises ValueError if provider_name is not in _VALID_AI_PROVIDERS.
+    """
     if provider_name not in _VALID_AI_PROVIDERS:
         raise ValueError(
             f"Invalid AI provider: {provider_name!r}. Must be one of: {', '.join(sorted(_VALID_AI_PROVIDERS))}"

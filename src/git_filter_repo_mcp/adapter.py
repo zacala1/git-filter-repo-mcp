@@ -180,13 +180,20 @@ class GitFilterRepoAdapter:
     _RECORD_SEP = "\x00"
 
     def get_commits(self, branch: str = "HEAD", max_count: int | None = None) -> list[CommitInfo]:
-        """Get commit information from the repository."""
+        """Get commit information from the repository.
+
+        Args:
+            branch: Git ref to read (branch name, tag, or HEAD).
+            max_count: Limit number of commits returned. None means all.
+
+        Returns:
+            List of CommitInfo ordered newest-first. Empty list if repo has
+            no commits or branch is invalid.
+        """
         self._validate_ref(branch)
         sep = self._FIELD_SEP
-        # Use %B (full body) instead of %s (subject only) to preserve multi-line messages.
-        # Put %B last so split(sep, 6) captures the entire body in the final field.
-        # Use %x00 (git's hex escape for null byte) as record separator — can't use literal
-        # \x00 in args because Windows subprocess rejects embedded null characters.
+        # %B (full body) goes last so split(sep, 6) captures multi-line messages.
+        # %x00 is used as record separator because Windows rejects literal null bytes.
         args = ["log", f"--format=%x00%H{sep}%an{sep}%ae{sep}%cn{sep}%ce{sep}%aI{sep}%B", branch]
         if max_count is not None:
             args.append(f"-n{max_count}")
@@ -201,12 +208,10 @@ class GitFilterRepoAdapter:
             record = record.strip()
             if not record:
                 continue
-            # Fields: hash, author_name, author_email,
-            # committer_name, committer_email, date, message (last, may contain sep)
+            # Format fields: hash, author_name, author_email,
+            # committer_name, committer_email, date(ISO), message(full body)
             parts = record.split(sep, 6)
             if len(parts) >= 7:
-                # Reorder to match CommitInfo: hash, author_name, author_email,
-                # committer_name, committer_email, message, date
                 h, an, ae, cn, ce, date, message = parts
                 commits.append(CommitInfo(h, an, ae, cn, ce, message.strip(), date))
         return commits
@@ -222,7 +227,11 @@ class GitFilterRepoAdapter:
         return _parse_lines(self._run_git_fast("show", "--name-only", "--format=", commit_hash).stdout)
 
     def analyze_history(self, branch: str = "HEAD", max_count: int = 100) -> dict:
-        """Analyze repository history for potential rewrites."""
+        """Analyze repository history and return summary statistics.
+
+        Returns dict with keys: total_commits, total_authors, authors (name->count),
+        commits (list of recent commit previews with hash, author, message, date).
+        """
         commits = self.get_commits(branch, max_count)
 
         authors = {}
@@ -332,7 +341,11 @@ class GitFilterRepoAdapter:
         dry_run: bool = True,
         force: bool = False,
     ) -> FilterResult:
-        """Change author/committer information for commits."""
+        """Change author/committer information for commits matching old_email.
+
+        Uses git-filter-repo's --mailmap. If no commits match old_email,
+        returns success with a message listing existing author emails.
+        """
         for label, value in [("name", new_name), ("email", new_email), ("old_email", old_email)]:
             if not value or not value.strip():
                 return FilterResult(
@@ -429,7 +442,11 @@ class GitFilterRepoAdapter:
     def remove_large_files(
         self, size_threshold_mb: float = 10.0, dry_run: bool = True, force: bool = False,
     ) -> FilterResult:
-        """Remove files larger than threshold from history."""
+        """Find and remove files larger than size_threshold_mb from history.
+
+        Uses git cat-file --batch-check for efficient bulk size queries,
+        with per-object fallback if batch mode fails.
+        """
         try:
             result = self._run_git("rev-list", "--objects", "--all")
         except subprocess.CalledProcessError:
@@ -589,7 +606,11 @@ class GitFilterRepoAdapter:
     def collect_commit_files(
         self, commits: list[CommitInfo], branch: str, max_commits: int,
     ) -> dict[str, list[str]]:
-        """Collect file lists for commits, bulk-fetched with per-commit fallback."""
+        """Collect file lists for commits in a single git log call.
+
+        Returns {commit_hash: [file_paths]}. Falls back to per-commit
+        get_commit_files (first 20) if the bulk call fails.
+        """
         try:
             result = self._run_git(
                 "log", "--name-only", "--format=%H", f"-n{max_commits}", branch,
@@ -609,7 +630,15 @@ class GitFilterRepoAdapter:
     def _scan_file_contents(
         self, files_to_scan: list[tuple[str, str]],
     ) -> list[dict]:
-        """Scan file contents for secrets, returning finding dicts."""
+        """Scan file contents for secrets.
+
+        Args:
+            files_to_scan: List of (commit_hash, file_path) tuples.
+
+        Returns:
+            List of finding dicts with keys: type, description, severity,
+            file, commit, line, matched. Capped at MAX_FINDINGS_LIMIT.
+        """
         from .secrets import scan_content
 
         findings: list[dict] = []
@@ -634,7 +663,11 @@ class GitFilterRepoAdapter:
         branch: str = "HEAD",
         max_commits: int = 100,
     ) -> dict:
-        """Scan repository history for potential secrets."""
+        """Scan repository history for secrets and sensitive files.
+
+        Returns dict with keys: message (summary), commits_scanned, secrets_found,
+        sensitive_files (count), findings (list), sensitive_file_list, files_scanned.
+        """
         from .secrets import get_file_risk_level, is_sensitive_file
 
         commits = self.get_commits(branch, max_commits)
@@ -926,7 +959,15 @@ class GitFilterRepoAdapter:
         preserve_order: bool,
         start_date: str | None,
     ) -> dict[str, tuple[int, str]] | FilterResult:
-        """Generate new date mappings for commits within the specified time constraints."""
+        """Generate randomized date mappings for commits within time constraints.
+
+        Supports wrap-around ranges (e.g. 22:00-02:00). When preserve_order is True,
+        ensures each commit timestamp is strictly after the previous one.
+
+        Returns:
+            {commit_hash: (unix_timestamp, tz_offset_str)} on success,
+            or FilterResult on validation error (e.g. bad start_date).
+        """
 
         commit_dates = []
         for commit in commits:
@@ -1015,7 +1056,11 @@ class GitFilterRepoAdapter:
         return date_mappings
 
     def _create_date_callback_code(self, date_mappings: dict[str, tuple[int, str]]) -> str:
-        """Build inline callback code for date rewriting."""
+        """Build git-filter-repo --commit-callback code for date rewriting.
+
+        The generated code is exec'd by git-filter-repo with `commit` in scope.
+        It looks up commit.original_id in a base64-encoded date mapping dict.
+        """
         serializable = {h: [ts, tz] for h, (ts, tz) in date_mappings.items()}
         encoded = self._encode_callback_data(serializable)
 

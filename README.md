@@ -133,7 +133,7 @@ Add to Claude Desktop config:
 
 ```bash
 uv sync --all-extras
-uv run pytest tests/ -v       # 320 tests
+uv run pytest tests/ -v       # 325 tests
 uv run ruff check src/ tests/ # lint
 uv run pyright src/            # type check
 ```
