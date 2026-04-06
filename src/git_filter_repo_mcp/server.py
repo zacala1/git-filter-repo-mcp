@@ -73,6 +73,10 @@ def tool_handler(name: str):
                 return {"success": False, "error": msg, "error_code": code}
             except RuntimeError as e:
                 return {"success": False, "error": str(e), "error_code": ErrorCode.COMMAND_FAILED}
+            except subprocess.CalledProcessError as e:
+                cmd = e.cmd[0] if isinstance(e.cmd, list) else str(e.cmd)
+                logger.warning("%s: %s failed (rc=%d)", name, cmd, e.returncode)
+                return {"success": False, "error": f"Command failed: {cmd} (exit code {e.returncode})", "error_code": ErrorCode.COMMAND_FAILED}
             except subprocess.TimeoutExpired as e:
                 logger.warning("%s timed out: %s", name, e)
                 return {"success": False, "error": f"Operation timed out ({e.timeout}s)", "error_code": ErrorCode.COMMAND_FAILED}
@@ -160,6 +164,8 @@ async def _handle_rewrite_messages(args: dict) -> dict:
 
     if params.use_ai:
         ai_provider_name = params.ai_provider or get_config().ai.provider
+        if ai_provider_name == "none":
+            return {"success": False, "error": "AI provider is set to 'none'. Configure a provider or pass ai_provider explicitly.", "error_code": ErrorCode.INVALID_INPUT}
         provider = _create_ai_provider(args, ai_provider_name)
         engine = AICommitEngine(provider, MessageStyle(params.style))
 
@@ -200,6 +206,9 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                     "total_rewrites": len(rewrites),
                     "ai_provider": ai_provider_name,
                 }
+
+            if not rewrites:
+                return {"success": True, "message": "No commits need rewriting", "ai_provider": ai_provider_name}
 
             backup = _maybe_backup(adapter, dry_run)
             rewrite_by_hash = {r["hash"]: r["new"] for r in rewrites}
@@ -373,6 +382,8 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
 
     if not new_message and params.use_ai:
         ai_provider_name = params.ai_provider or get_config().ai.provider
+        if ai_provider_name == "none":
+            return {"success": False, "error": "AI provider is set to 'none'. Configure a provider or pass ai_provider explicitly.", "error_code": ErrorCode.INVALID_INPUT}
         provider = _create_ai_provider(args, ai_provider_name)
         engine = AICommitEngine(provider, MessageStyle.CONVENTIONAL)
         try:

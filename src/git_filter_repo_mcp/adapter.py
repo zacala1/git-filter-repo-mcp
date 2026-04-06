@@ -455,7 +455,8 @@ class GitFilterRepoAdapter:
                 capture_output=True, check=True, encoding="utf-8", errors="replace",
                 timeout=TIMEOUT_DEFAULT,
             )
-            for blob_hash, size_str in zip(object_hashes, _parse_lines(batch_result.stdout)):
+            size_lines = batch_result.stdout.strip().split("\n")
+            for blob_hash, size_str in zip(object_hashes, size_lines):
                 size = _safe_int(size_str)
                 if size > size_bytes:
                     large_files.append((objects_with_paths.get(blob_hash, blob_hash), size / (1024 * 1024)))

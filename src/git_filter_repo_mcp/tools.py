@@ -1,6 +1,7 @@
 """MCP tool definitions for git-filter-repo operations."""
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -30,7 +31,7 @@ class RewriteCommitMessagesInput(BaseModel):
 
     repo_path: str = Field(description="Path to the git repository")
     branch: str = Field(default="HEAD", description="Branch to rewrite")
-    style: str = Field(
+    style: Literal["conventional", "gitmoji", "simple", "detailed"] = Field(
         default="conventional",
         description="Message style: conventional, gitmoji, simple, or detailed",
     )
