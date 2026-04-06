@@ -1196,3 +1196,68 @@ class TestReplaceTextValidation:
                 "repo_path": "/tmp/repo", "old_text": "", "new_text": "x", "dry_run": True,
             })
             assert result["success"] is False
+
+
+class TestManualMappingsRealExecution:
+    """Test rewrite_commit_messages with manual_mappings, dry_run=False."""
+
+    @pytest.mark.asyncio
+    async def test_manual_mappings_real_calls_adapter(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
+             patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.auto_backup = True
+            mock_adapter = MagicMock()
+            mock_adapter.create_backup.return_value = "backup_test"
+            mock_adapter.rewrite_commit_messages.return_value = FilterResult(
+                success=True, message="Rewrote 1", commits_processed=3, commits_rewritten=1,
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool("rewrite_commit_messages", {
+                "repo_path": "/tmp/repo", "use_ai": False,
+                "manual_mappings": {"old": "new"}, "dry_run": False,
+            })
+
+            assert result["success"] is True
+            assert result["backup_branch"] == "backup_test"
+            mock_adapter.rewrite_commit_messages.assert_called_once()
+            mock_adapter.create_backup.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_manual_mappings_no_backup_on_dry_run(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
+             patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.auto_backup = True
+            mock_adapter = MagicMock()
+            mock_adapter.rewrite_commit_messages.return_value = FilterResult(
+                success=True, message="Dry run", dry_run=True,
+            )
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool("rewrite_commit_messages", {
+                "repo_path": "/tmp/repo", "use_ai": False,
+                "manual_mappings": {"old": "new"}, "dry_run": True,
+            })
+
+            assert result["success"] is True
+            assert "backup_branch" not in result
+            mock_adapter.create_backup.assert_not_called()
+
+
+class TestScanSecretsEmptyRepo:
+    """Test scan_secrets on various repo states."""
+
+    @pytest.mark.asyncio
+    async def test_empty_repo_scan(self):
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+            mock_adapter = MagicMock()
+            mock_adapter.scan_secrets.return_value = {
+                "commits_scanned": 0, "secrets_found": 0,
+                "sensitive_files": 0, "findings": [],
+                "sensitive_file_list": [], "files_scanned": 0,
+            }
+            MockAdapter.return_value = mock_adapter
+
+            result = await _execute_tool("scan_secrets", {"repo_path": "/tmp/repo"})
+            assert result["success"] is True
+            assert result["secrets_found"] == 0

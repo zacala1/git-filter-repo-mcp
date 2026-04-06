@@ -1153,3 +1153,164 @@ class TestScanSecretsSensitiveDedup:
         # .env should appear only once in sensitive_file_list
         env_entries = [f for f in result["sensitive_file_list"] if f["file"] == ".env"]
         assert len(env_entries) == 1
+
+
+class TestValidateRef:
+    """Test _validate_ref dash-prefix rejection."""
+
+    def test_normal_ref_accepted(self):
+        adapter = _make_mock_adapter()
+        adapter._validate_ref("HEAD")
+        adapter._validate_ref("abc123")
+        adapter._validate_ref("main")
+
+    def test_dash_ref_rejected(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError, match="must not start with"):
+            adapter._validate_ref("--exec=evil")
+
+    def test_single_dash_rejected(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError, match="must not start with"):
+            adapter._validate_ref("-n5")
+
+
+class TestReplaceTextEmptyOldText:
+    """Test that empty old_text is rejected."""
+
+    @requires_git_filter_repo
+    def test_empty_old_text_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.replace_text_in_history(old_text="", new_text="x", dry_run=True)
+        assert result.success is False
+        assert "empty" in result.message.lower()
+
+
+@requires_git_filter_repo
+class TestSquashCommitsRealExecution:
+    """Test squash_commits actual execution (not dry_run)."""
+
+    def test_squash_actually_squashes(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        assert len(commits) == 3
+        # commits[2] = Initial commit (oldest), commits[0] = Add config (newest/HEAD)
+        # squash_commits(start=exclusive, end=inclusive) so commits AFTER start get squashed
+        start = commits[2].hash  # Initial commit is excluded
+
+        result = adapter.squash_commits(start_commit=start, end_commit="HEAD", new_message="squashed two", dry_run=False)
+        assert result.success is True
+        assert result.commits_rewritten == 1
+        assert result.commits_processed == 2  # 2 commits after initial
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        commits_after = adapter2.get_commits()
+        # Initial commit + 1 squashed commit = 2 total
+        assert len(commits_after) == 2
+        assert commits_after[0].message == "squashed two"
+        assert commits_after[1].message == "Initial commit"
+
+    def test_squash_without_custom_message(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        start = commits[2].hash  # Initial commit (exclusive)
+
+        result = adapter.squash_commits(start_commit=start, end_commit="HEAD", dry_run=False)
+        assert result.success is True
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        commits_after = adapter2.get_commits()
+        assert len(commits_after) == 2  # Initial + squashed
+        assert "Squashed commits:" in commits_after[0].message
+        assert "Add config" in commits_after[0].message
+
+
+@requires_git_filter_repo
+class TestRewriteMessagesDuplicateMessages:
+    """Test that rewrite_commit_messages handles duplicate messages via hash-based lookup."""
+
+    def test_duplicate_messages_both_rewritten(self, temp_git_repo):
+        """Two commits with same message should both get rewritten."""
+        # Add another commit with same "Add config" message
+        (temp_git_repo / "config2.json").write_text('{"key2": "val2"}')
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Add config"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits()
+        dup_msgs = [c for c in commits if c.message == "Add config"]
+        assert len(dup_msgs) == 2, "Should have 2 commits with same message"
+
+        def callback(msg, _hash):
+            if msg == "Add config":
+                return "chore: add configuration"
+            return msg
+
+        result = adapter.rewrite_commit_messages(callback, dry_run=False, force=True)
+        assert result.success is True
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        commits_after = adapter2.get_commits()
+        rewritten = [c for c in commits_after if c.message == "chore: add configuration"]
+        assert len(rewritten) == 2, f"Both duplicates should be rewritten, got {[c.message for c in commits_after]}"
+
+
+@requires_git_filter_repo
+class TestChangeDatesNightRange:
+    """Test change_commit_dates with night wrap-around range (22:00-02:00)."""
+
+    def test_night_range_produces_valid_times(self, temp_git_repo):
+        import datetime
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_commit_dates(time_range="night", dry_run=False, force=True)
+        assert result.success is True
+
+        adapter2 = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter2.get_commits()
+        for c in commits:
+            dt = datetime.datetime.fromisoformat(c.date)
+            hour = dt.hour
+            # Night range: 22:00-02:00 means hour in {22, 23, 0, 1, 2}
+            assert hour >= 22 or hour <= 2, f"Hour {hour} outside night range for commit {c.hash[:8]}"
+
+
+@requires_git_filter_repo
+class TestScanSecretsPatternMatching:
+    """Test scan_secrets actually detects various secret patterns."""
+
+    def test_detects_aws_access_key(self, temp_git_repo):
+        (temp_git_repo / "creds.txt").write_text("key = AKIAIOSFODNN7EXAMPLE")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add creds"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.scan_secrets()
+        assert result["secrets_found"] >= 1
+        aws_findings = [f for f in result["findings"] if f["type"] == "aws_access_key"]
+        assert len(aws_findings) >= 1
+
+    def test_detects_github_token(self, temp_git_repo):
+        (temp_git_repo / "token.txt").write_text("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add token"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.scan_secrets()
+        gh_findings = [f for f in result["findings"] if f["type"] == "github_token"]
+        assert len(gh_findings) >= 1
+
+    def test_detects_private_key(self, temp_git_repo):
+        (temp_git_repo / "key.pem").write_text("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add key"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.scan_secrets()
+        pk_findings = [f for f in result["findings"] if f["type"] == "private_key"]
+        assert len(pk_findings) >= 1
+
+    def test_no_false_positive_on_clean_repo(self, single_commit_repo):
+        adapter = GitFilterRepoAdapter(str(single_commit_repo))
+        result = adapter.scan_secrets()
+        assert result["secrets_found"] == 0

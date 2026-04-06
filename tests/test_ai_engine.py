@@ -431,3 +431,121 @@ class TestAnthropicProviderHTTP:
         connected, status = await provider.check_connection()
         assert connected is True
         assert status == "Connected"
+
+
+class TestProviderClose:
+    """Test that close() properly closes the httpx client."""
+
+    @pytest.mark.asyncio
+    async def test_ollama_close(self):
+        provider = OllamaProvider()
+        provider.client = AsyncMock()
+        await provider.close()
+        provider.client.aclose.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_openai_close(self):
+        provider = OpenAIProvider(api_key="test")
+        provider.client = AsyncMock()
+        await provider.close()
+        provider.client.aclose.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_anthropic_close(self):
+        provider = AnthropicProvider(api_key="test")
+        provider.client = AsyncMock()
+        await provider.close()
+        provider.client.aclose.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_engine_close_calls_provider_close(self):
+        provider = OllamaProvider()
+        provider.client = AsyncMock()
+        engine = AICommitEngine(provider=provider)
+        await engine.close()
+        provider.client.aclose.assert_called_once()
+
+
+class TestGenerateMessageHTTPStatusError:
+    """Test generate_message fallback on HTTP errors."""
+
+    @pytest.mark.asyncio
+    async def test_http_error_raises_when_raise_on_error(self):
+        provider = OllamaProvider(raise_on_error=True)
+        provider.client = AsyncMock()
+        provider.client.post.side_effect = httpx.HTTPStatusError(
+            "500 Internal Server Error",
+            request=MagicMock(),
+            response=MagicMock(status_code=500),
+        )
+        ctx = CommitContext(original_message="test", commit_hash="abc", files_changed=[])
+        with pytest.raises(AIConnectionError, match="Ollama"):
+            await provider.generate_message(ctx, MessageStyle.SIMPLE)
+
+    @pytest.mark.asyncio
+    async def test_http_error_fallback_when_silent(self):
+        provider = OpenAIProvider(api_key="test", raise_on_error=False)
+        provider.client = AsyncMock()
+        provider.client.post.side_effect = httpx.HTTPStatusError(
+            "500",
+            request=MagicMock(),
+            response=MagicMock(status_code=500),
+        )
+        ctx = CommitContext(original_message="original msg", commit_hash="abc", files_changed=[])
+        result = await provider.generate_message(ctx, MessageStyle.SIMPLE)
+        assert result == "original msg"
+        assert provider._last_error is not None
+
+
+class TestBuildPromptEdgeCases:
+    """Test build_prompt with edge cases."""
+
+    def test_many_files_truncated(self):
+        ctx = CommitContext(
+            original_message="test",
+            commit_hash="abc",
+            files_changed=[f"file{i}.py" for i in range(20)],
+        )
+        prompt = build_prompt(ctx, MessageStyle.SIMPLE)
+        assert "+10 more" in prompt
+
+    def test_diff_summary_truncated(self):
+        ctx = CommitContext(
+            original_message="test",
+            commit_hash="abc",
+            files_changed=[],
+            diff_summary="x" * 1000,
+        )
+        prompt = build_prompt(ctx, MessageStyle.SIMPLE)
+        # Should truncate at 500 chars
+        assert len(prompt) < 1500
+
+    def test_empty_files_and_diff(self):
+        ctx = CommitContext(
+            original_message="test msg",
+            commit_hash="abc",
+            files_changed=[],
+        )
+        prompt = build_prompt(ctx, MessageStyle.DETAILED)
+        assert "test msg" in prompt
+        assert "Files changed" not in prompt
+
+
+class TestConventionalPrefixVariants:
+    """Test that all conventional prefixes are recognized."""
+
+    def test_all_prefixes_recognized(self):
+        provider = OllamaProvider()
+        for prefix in ["feat:", "fix:", "docs:", "style:", "refactor:", "test:", "chore:", "perf:", "ci:", "build:", "revert:"]:
+            result = provider._parse_response(f"{prefix} something", MessageStyle.CONVENTIONAL)
+            assert not result.startswith("chore: " + prefix), f"{prefix} should be recognized"
+
+    def test_case_insensitive(self):
+        provider = OllamaProvider()
+        result = provider._parse_response("FEAT: add feature", MessageStyle.CONVENTIONAL)
+        assert result == "FEAT: add feature"  # Not re-prefixed
+
+    def test_non_conventional_gets_chore_prefix(self):
+        provider = OllamaProvider()
+        result = provider._parse_response("update something", MessageStyle.CONVENTIONAL)
+        assert result == "chore: update something"

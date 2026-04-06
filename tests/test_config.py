@@ -215,3 +215,61 @@ class TestReloadConfig:
             assert new_config.ai.model == "test-reload-model"
         finally:
             config_mod._config = old_config
+
+
+class TestEnvVarPriority:
+    """Test that environment variables override config file values."""
+
+    def test_env_overrides_config_file(self, monkeypatch, tmp_path):
+        from git_filter_repo_mcp.config import Config, _apply_config_dict, _apply_env_vars
+
+        config = Config()
+        # Simulate config file setting provider to "ollama"
+        _apply_config_dict(config, {"ai": {"provider": "ollama", "model": "llama3.2"}})
+        assert config.ai.provider == "ollama"
+
+        # Env var should override
+        monkeypatch.setenv("GIT_FILTER_REPO_AI_PROVIDER", "anthropic")
+        monkeypatch.setenv("GIT_FILTER_REPO_AI_MODEL", "claude-3")
+        _apply_env_vars(config)
+        assert config.ai.provider == "anthropic"
+        assert config.ai.model == "claude-3"
+
+    def test_openai_base_url_from_env(self, monkeypatch):
+        from git_filter_repo_mcp.config import Config, _apply_env_vars
+
+        config = Config()
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://my-proxy.com/v1")
+        _apply_env_vars(config)
+        assert config.ai.openai_base_url == "https://my-proxy.com/v1"
+
+    def test_unset_env_keeps_defaults(self, monkeypatch):
+        from git_filter_repo_mcp.config import Config, _apply_env_vars
+
+        # Ensure vars are not set
+        for key in ["GIT_FILTER_REPO_AI_PROVIDER", "GIT_FILTER_REPO_AI_MODEL",
+                     "OLLAMA_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL",
+                     "ANTHROPIC_API_KEY", "GIT_FILTER_REPO_LOG_LEVEL"]:
+            monkeypatch.delenv(key, raising=False)
+
+        config = Config()
+        _apply_env_vars(config)
+        assert config.ai.provider == "ollama"
+        assert config.ai.model == "llama3.2"
+        assert config.server.log_level == "INFO"
+
+
+class TestReloadConfigActuallyReloads:
+    """Test that reload_config picks up new values."""
+
+    def test_reload_changes_global_config(self, monkeypatch):
+        import git_filter_repo_mcp.config as config_mod
+        old_config = config_mod._config
+        try:
+            monkeypatch.setenv("GIT_FILTER_REPO_LOG_LEVEL", "DEBUG")
+            new_config = reload_config()
+            assert new_config.server.log_level == "DEBUG"
+            # get_config should now return the reloaded one
+            assert get_config().server.log_level == "DEBUG"
+        finally:
+            config_mod._config = old_config

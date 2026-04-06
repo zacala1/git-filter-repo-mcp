@@ -4,12 +4,13 @@ MCP server for git-filter-repo - AI-assisted git history rewriting.
 
 ## Features
 
-- **Commit Rewriting** - AI-powered message rewriting (Ollama/OpenAI/Anthropic)
+- **Commit Rewriting** - AI-powered message rewriting (Ollama/OpenAI/Anthropic) or manual mappings
 - **Author/Date Changes** - Bulk update author info, move commits to evenings/weekends
 - **File Operations** - Remove files, large files, filter paths from history
-- **Secret Scanning** - Detect API keys, tokens, credentials
+- **Secret Scanning** - Detect API keys, tokens, credentials with severity levels
 - **Text Replacement** - Find and replace across all commits
-- **Backup/Restore** - Auto-backup before destructive operations
+- **Backup/Restore** - Auto-backup before every destructive operation
+- **Squash Commits** - Merge commit ranges into a single commit
 
 ## Requirements
 
@@ -70,33 +71,41 @@ Add to Claude Desktop config:
 | `GIT_FILTER_REPO_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 | `OLLAMA_BASE_URL` | Ollama server URL | `http://localhost:11434` |
 | `OPENAI_API_KEY` | OpenAI API key | - |
+| `OPENAI_BASE_URL` | OpenAI-compatible API base URL | `https://api.openai.com/v1` |
 | `ANTHROPIC_API_KEY` | Anthropic API key | - |
 
-## Tools
+## Tools (16)
 
-### Analysis
+### Analysis (read-only)
 
-- `analyze_git_history` - Commit stats, authors
-- `get_commit_details` - View specific commit
-- `get_file_history` - Track file changes
-- `list_all_files_in_history` - List all files
-- `scan_secrets` - Find credentials
+| Tool | Description |
+|------|-------------|
+| `analyze_git_history` | Commit stats, author breakdown, recent commits |
+| `get_commit_details` | Full details for a specific commit |
+| `get_file_history` | Commit history for a specific file |
+| `list_all_files_in_history` | All files that ever existed in the repo |
+| `scan_secrets` | Detect API keys, tokens, credentials |
 
-### Modification
+### Modification (destructive - use `dry_run: true` first)
 
-- `rewrite_commit_messages` - AI message rewriting
-- `rewrite_single_commit` - Edit one commit
-- `change_author` - Bulk author change
-- `change_commit_dates` - Move to evenings/weekends
-- `remove_files_from_history` - Delete files
-- `remove_large_files` - Remove by size
-- `filter_paths` - Include/exclude paths
-- `replace_text_in_history` - Search and replace
-- `squash_commits` - Merge commits
+| Tool | Description |
+|------|-------------|
+| `rewrite_commit_messages` | AI or manual message rewriting |
+| `rewrite_single_commit` | Edit one commit's message/author |
+| `change_author` | Bulk author/email change |
+| `change_commit_dates` | Move commits to evenings/weekends |
+| `remove_files_from_history` | Delete files from all history |
+| `remove_large_files` | Remove files above a size threshold |
+| `filter_paths` | Keep or exclude specific paths |
+| `replace_text_in_history` | Search and replace across history |
+| `squash_commits` | Merge a commit range into one |
 
-### Utility
+### Backup
 
-- `create_backup` / `restore_backup`
+| Tool | Description |
+|------|-------------|
+| `create_backup` | Create a backup branch |
+| `restore_backup` | Restore from a backup branch |
 
 ## Usage Examples
 
@@ -108,21 +117,25 @@ Add to Claude Desktop config:
 "Move commits to evening hours"
 "Find files larger than 10MB"
 "Scan for API keys"
+"Squash the last 3 commits"
 ```
 
 ## Safety
 
-1. Use `dry_run: true` first
-2. Backups are auto-created
-3. Use `git push --force-with-lease` after changes
-4. Coordinate with team before shared branch changes
+- All destructive tools default to `dry_run: true`
+- Backups are automatically created **before** every destructive operation
+- Input validation blocks injection attempts (dash-prefixed args, invalid hashes)
+- Timeout protection prevents hanging on large repos
+- Use `git push --force-with-lease` after changes
+- Coordinate with team before shared branch changes
 
 ## Development
 
 ```bash
 uv sync --all-extras
-uv run pytest tests/ -v
-uv run ruff check src/
+uv run pytest tests/ -v       # 278 tests
+uv run ruff check src/ tests/ # lint
+uv run pyright src/            # type check
 ```
 
 ## License
