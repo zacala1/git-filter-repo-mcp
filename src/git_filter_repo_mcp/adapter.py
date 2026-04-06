@@ -181,6 +181,7 @@ class GitFilterRepoAdapter:
 
     def get_commits(self, branch: str = "HEAD", max_count: int | None = None) -> list[CommitInfo]:
         """Get commit information from the repository."""
+        self._validate_ref(branch)
         sep = self._FIELD_SEP
         # Use %B (full body) instead of %s (subject only) to preserve multi-line messages.
         # Put %B last so split(sep, 6) captures the entire body in the final field.
@@ -211,11 +212,13 @@ class GitFilterRepoAdapter:
         return commits
 
     def get_commit_diff(self, commit_hash: str) -> str:
-        """Get diff for a commit."""
+        """Get diff stat for a commit."""
+        self._validate_ref(commit_hash)
         return self._run_git("show", "--stat", commit_hash).stdout or ""
 
     def get_commit_files(self, commit_hash: str) -> list[str]:
         """Get files changed in a commit."""
+        self._validate_ref(commit_hash)
         return _parse_lines(self._run_git_fast("show", "--name-only", "--format=", commit_hash).stdout)
 
     def analyze_history(self, branch: str = "HEAD", max_count: int = 100) -> dict:
@@ -237,7 +240,7 @@ class GitFilterRepoAdapter:
                 {
                     "hash": c.hash[:8],
                     "author": f"{c.author_name} <{c.author_email}>",
-                    "message": c.message[:80],
+                    "message": c.message[:80] + ("..." if len(c.message) > 80 else ""),
                     "date": c.date,
                 }
                 for c in commits[:MAX_PREVIEW_COMMITS]
@@ -331,6 +334,11 @@ class GitFilterRepoAdapter:
     ) -> FilterResult:
         """Change author/committer information for commits."""
         for label, value in [("name", new_name), ("email", new_email), ("old_email", old_email)]:
+            if not value or not value.strip():
+                return FilterResult(
+                    success=False,
+                    message=f"{label} must not be empty",
+                )
             if any(c in value for c in "<>\n\r\t"):
                 return FilterResult(
                     success=False,
@@ -339,6 +347,16 @@ class GitFilterRepoAdapter:
 
         commits = self.get_commits()
         affected = [c for c in commits if c.author_email == old_email]
+
+        if not affected:
+            unique_emails = sorted({c.author_email for c in commits})
+            return FilterResult(
+                success=True,
+                message=f"No commits found with email '{old_email}'. Existing authors: {', '.join(unique_emails)}",
+                commits_processed=len(commits),
+                commits_rewritten=0,
+                dry_run=dry_run,
+            )
 
         if dry_run:
             return FilterResult(
@@ -379,6 +397,8 @@ class GitFilterRepoAdapter:
         force: bool = False,
     ) -> FilterResult:
         """Remove files from entire git history."""
+        if not paths:
+            return FilterResult(success=False, message="No file paths provided")
         self._validate_paths(paths)
         if dry_run:
             try:
@@ -634,9 +654,19 @@ class GitFilterRepoAdapter:
 
         findings = self._scan_file_contents(files_to_scan)
 
+        total_findings = len(findings)
+        total_sensitive = len(sensitive_files)
+        summary_parts = []
+        if total_findings:
+            summary_parts.append(f"{total_findings} secret(s) found")
+        if total_sensitive:
+            summary_parts.append(f"{total_sensitive} sensitive file(s)")
+        message = "; ".join(summary_parts) if summary_parts else "No secrets or sensitive files found"
+
         return {
-            "commits_scanned": len(commits), "secrets_found": len(findings),
-            "sensitive_files": len(sensitive_files), "findings": findings[:MAX_FINDINGS_LIMIT],
+            "message": message,
+            "commits_scanned": len(commits), "secrets_found": total_findings,
+            "sensitive_files": total_sensitive, "findings": findings[:MAX_FINDINGS_LIMIT],
             "sensitive_file_list": sensitive_files[:MAX_PREVIEW_COMMITS], "files_scanned": len(files_to_scan),
         }
 

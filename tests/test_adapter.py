@@ -1314,3 +1314,113 @@ class TestScanSecretsPatternMatching:
         adapter = GitFilterRepoAdapter(str(single_commit_repo))
         result = adapter.scan_secrets()
         assert result["secrets_found"] == 0
+
+
+class TestChangeAuthorEmptyFields:
+    """Test that empty author fields are rejected."""
+
+    @requires_git_filter_repo
+    def test_empty_name_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author("test@example.com", "", "new@example.com", dry_run=True)
+        assert result.success is False
+        assert "empty" in result.message.lower()
+
+    @requires_git_filter_repo
+    def test_whitespace_only_name_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author("test@example.com", "  ", "new@example.com", dry_run=True)
+        assert result.success is False
+
+    @requires_git_filter_repo
+    def test_empty_old_email_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author("", "Name", "new@example.com", dry_run=True)
+        assert result.success is False
+
+
+class TestChangeAuthorNoMatch:
+    """Test that change_author shows helpful message when email not found."""
+
+    @requires_git_filter_repo
+    def test_no_match_shows_existing_emails(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.change_author("nonexistent@email.com", "Name", "new@e.com", dry_run=True)
+        assert result.success is True
+        assert result.commits_rewritten == 0
+        assert "nonexistent@email.com" in result.message
+        assert "test@example.com" in result.message  # Should show existing email
+
+
+class TestGetCommitsDashInjection:
+    """Test that get_commits rejects dash-prefixed branch names."""
+
+    @requires_git_filter_repo
+    def test_dash_branch_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        with pytest.raises(ValueError, match="must not start with"):
+            adapter.get_commits(branch="--exec=evil")
+
+    @requires_git_filter_repo
+    def test_normal_branch_accepted(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        commits = adapter.get_commits(branch="HEAD")
+        assert len(commits) == 3
+
+
+class TestRemoveFilesEmptyPaths:
+    """Test that remove_files rejects empty paths list."""
+
+    @requires_git_filter_repo
+    def test_empty_list_rejected(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.remove_files([], dry_run=True)
+        assert result.success is False
+        assert "No file paths" in result.message
+
+
+class TestAnalyzeHistoryTruncation:
+    """Test that long commit messages get '...' indicator."""
+
+    @requires_git_filter_repo
+    def test_long_message_truncated_with_ellipsis(self, temp_git_repo):
+        long_msg = "feat: " + "a" * 100
+        (temp_git_repo / "long.txt").write_text("content")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", long_msg], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.analyze_history()
+        latest = result["commits"][0]
+        assert latest["message"].endswith("...")
+        assert len(latest["message"]) == 83  # 80 + "..."
+
+    @requires_git_filter_repo
+    def test_short_message_no_ellipsis(self, temp_git_repo):
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.analyze_history()
+        for c in result["commits"]:
+            if len(c["message"]) < 80:
+                assert not c["message"].endswith("...")
+
+
+class TestScanSecretsMessageField:
+    """Test that scan_secrets response includes a summary message."""
+
+    @requires_git_filter_repo
+    def test_clean_repo_has_no_secrets_message(self, single_commit_repo):
+        adapter = GitFilterRepoAdapter(str(single_commit_repo))
+        result = adapter.scan_secrets()
+        assert "message" in result
+        assert "No secrets" in result["message"]
+
+    @requires_git_filter_repo
+    def test_repo_with_secrets_has_count_message(self, temp_git_repo):
+        (temp_git_repo / "key.txt").write_text("AKIAIOSFODNN7EXAMPLE")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add key"], cwd=temp_git_repo, capture_output=True)
+
+        adapter = GitFilterRepoAdapter(str(temp_git_repo))
+        result = adapter.scan_secrets()
+        assert "message" in result
+        assert "secret" in result["message"].lower()
