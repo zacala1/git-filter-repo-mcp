@@ -1,6 +1,7 @@
 """git-filter-repo adapter - wraps git-filter-repo commands."""
 
 import base64
+import contextlib
 import datetime
 import json
 import logging
@@ -10,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -42,6 +44,63 @@ def _safe_int(value: str, default: int = 0) -> int:
         return int(value.strip())
     except (ValueError, AttributeError):
         return default
+
+
+@contextlib.contextmanager
+def _temp_file(content: str, suffix: str) -> Iterator[str]:
+    """Write content to a named temp file and yield its path, deleting on exit.
+
+    Uses ``delete=False`` so the file is closed before being handed to git
+    subprocesses (required on Windows where the open handle would block
+    other readers).
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as f:
+        f.write(content)
+        path = f.name
+    try:
+        yield path
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+# --- git-filter-repo --commit-callback bodies ---
+#
+# These are Python source snippets exec'd by git-filter-repo with ``commit``
+# (and any decoded payload variables) in scope. Kept as module-level
+# constants so the embedded Python is easy to read and lint-friendly.
+
+_REWRITE_MESSAGES_BODY = """\
+_orig_id = commit.original_id.decode() if commit.original_id else None
+_msg_str = commit.message.decode("utf-8") if isinstance(commit.message, bytes) else commit.message
+_new_msg = None
+if _orig_id and _orig_id in _HASH_MAP:
+    _new_msg = _HASH_MAP[_orig_id]
+elif _msg_str.strip() in _MSG_MAP:
+    _new_msg = _MSG_MAP[_msg_str.strip()]
+if _new_msg is not None:
+    commit.message = _new_msg.encode("utf-8")"""
+
+_REWRITE_SINGLE_BODY = """\
+_TARGET = _PAYLOAD["target"]
+_CHANGES = _PAYLOAD["changes"]
+_orig_id = commit.original_id.decode() if commit.original_id else None
+if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
+    if "message" in _CHANGES:
+        commit.message = _CHANGES["message"].encode()
+    if "author_name" in _CHANGES:
+        commit.author_name = _CHANGES["author_name"].encode()
+        commit.committer_name = _CHANGES["author_name"].encode()
+    if "author_email" in _CHANGES:
+        commit.author_email = _CHANGES["author_email"].encode()
+        commit.committer_email = _CHANGES["author_email"].encode()"""
+
+_DATE_REWRITE_BODY = """\
+_commit_hash = commit.original_id.decode() if commit.original_id else None
+if _commit_hash and _commit_hash in _DATE_MAP:
+    _new_ts, _tz_offset = _DATE_MAP[_commit_hash]
+    _new_date = f"{_new_ts} {_tz_offset}".encode()
+    commit.author_date = _new_date
+    commit.committer_date = _new_date"""
 
 
 @dataclass
@@ -161,17 +220,20 @@ class GitFilterRepoAdapter:
         return self._run_command(cmd, check=False, timeout=TIMEOUT_LONG)
 
     @staticmethod
-    def _encode_callback_data(data: dict | list) -> str:
-        """Base64-encode data for safe embedding in git-filter-repo callbacks."""
-        return base64.b64encode(json.dumps(data).encode()).decode()
+    def _build_callback(payload: dict[str, dict | list], body: str) -> str:
+        """Compose a git-filter-repo --commit-callback Python source string.
 
-    @staticmethod
-    def _callback_preamble(encoded: str, var_name: str) -> str:
-        """Build the import + decode preamble for inline callback code."""
-        return (
-            f'import base64, json\n'
-            f'{var_name} = json.loads(base64.b64decode("{encoded}").decode())\n'
-        )
+        ``payload`` maps variable name to JSON-serialisable data; each entry is
+        base64-encoded and decoded at the top of the generated source so the
+        body can reference them by name. ``body`` is appended verbatim and
+        runs with ``commit`` plus the decoded variables in scope.
+        """
+        lines = ["import base64, json"]
+        for var, data in payload.items():
+            encoded = base64.b64encode(json.dumps(data).encode()).decode()
+            lines.append(f'{var} = json.loads(base64.b64decode("{encoded}").decode())')
+        lines.append(body)
+        return "\n".join(lines)
 
     # Record separator that won't appear in commit messages/names
     _FIELD_SEP = "\x1e"
@@ -229,8 +291,12 @@ class GitFilterRepoAdapter:
     def analyze_history(self, branch: str = "HEAD", max_count: int = 100) -> dict:
         """Analyze repository history and return summary statistics.
 
-        Returns dict with keys: total_commits, total_authors, authors (name->count),
-        commits (list of recent commit previews with hash, author, message, date).
+        Returns dict with keys:
+            total_commits: number of commits analyzed (capped at ``max_count``)
+            total_in_branch: total commits in the branch (independent of max_count);
+                None if the count could not be obtained (empty repo / bad ref)
+            total_authors, authors (name->count),
+            commits: recent commit previews (hash, author, message, date)
         """
         commits = self.get_commits(branch, max_count)
 
@@ -239,10 +305,17 @@ class GitFilterRepoAdapter:
             author_key = f"{commit.author_name} <{commit.author_email}>"
             authors[author_key] = authors.get(author_key, 0) + 1
 
-        # Skip file count for performance - can be slow on large repos
+        # True branch size (independent of max_count) — best-effort, cheap.
+        try:
+            total_in_branch: int | None = _safe_int(
+                self._run_git_fast("rev-list", "--count", branch).stdout
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            total_in_branch = None
 
         return {
             "total_commits": len(commits),
+            "total_in_branch": total_in_branch,
             "total_authors": len(authors),
             "authors": authors,
             "commits": [
@@ -293,23 +366,10 @@ class GitFilterRepoAdapter:
         # Hash-based takes priority to handle duplicate commit messages correctly.
         msg_replacements = {old: new for _, old, new in rewrites}
         hash_replacements = {h: new for h, _, new in rewrites}
-        encoded_msgs = self._encode_callback_data(msg_replacements)
-        encoded_hashes = self._encode_callback_data(hash_replacements)
 
-        # git-filter-repo exec's this with `message` and `commit` in scope
-        # --commit-callback gives us commit.original_id for hash-based lookup
-        callback_code = (
-            self._callback_preamble(encoded_hashes, '_HASH_MAP') +
-            f'_MSG_MAP = __import__("json").loads(__import__("base64").b64decode("{encoded_msgs}").decode())\n'
-            '_orig_id = commit.original_id.decode() if commit.original_id else None\n'
-            '_msg_str = commit.message.decode("utf-8") if isinstance(commit.message, bytes) else commit.message\n'
-            '_new_msg = None\n'
-            'if _orig_id and _orig_id in _HASH_MAP:\n'
-            '    _new_msg = _HASH_MAP[_orig_id]\n'
-            'elif _msg_str.strip() in _MSG_MAP:\n'
-            '    _new_msg = _MSG_MAP[_msg_str.strip()]\n'
-            'if _new_msg is not None:\n'
-            '    commit.message = _new_msg.encode("utf-8")'
+        callback_code = self._build_callback(
+            {"_HASH_MAP": hash_replacements, "_MSG_MAP": msg_replacements},
+            _REWRITE_MESSAGES_BODY,
         )
 
         result = self._run_filter_repo(
@@ -380,11 +440,8 @@ class GitFilterRepoAdapter:
                 dry_run=True,
             )
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".mailmap", delete=False) as f:
-            f.write(f"{new_name} <{new_email}> <{old_email}>\n")
-            mailmap_path = f.name
-
-        try:
+        mailmap = f"{new_name} <{new_email}> <{old_email}>\n"
+        with _temp_file(mailmap, ".mailmap") as mailmap_path:
             result = self._run_filter_repo("--mailmap", mailmap_path, dry_run=False, force=force)
 
             if result.returncode != 0:
@@ -400,8 +457,6 @@ class GitFilterRepoAdapter:
                 commits_processed=len(commits),
                 commits_rewritten=len(affected),
             )
-        finally:
-            Path(mailmap_path).unlink(missing_ok=True)
 
     def remove_files(
         self,
@@ -478,8 +533,8 @@ class GitFilterRepoAdapter:
                 if size > size_bytes:
                     large_files.append((objects_with_paths.get(blob_hash, blob_hash), size / (1024 * 1024)))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.warning("batch failed: %s", e)
-            for blob_hash in object_hashes[:100]:
+            logger.warning("batch failed, falling back to per-object cat-file: %s", e)
+            for blob_hash in object_hashes:
                 try:
                     size = _safe_int(self._run_git_fast("cat-file", "-s", blob_hash).stdout)
                     if size > size_bytes:
@@ -744,24 +799,9 @@ class GitFilterRepoAdapter:
         if not changes:
             return FilterResult(success=False, message="No changes specified")
 
-        encoded = self._encode_callback_data(changes)
-
-        # git-filter-repo exec's this with `commit` in scope
-        callback_code = (
-            self._callback_preamble(encoded, '_CHANGES') +
-            f'_TARGET = "{commit_hash}"\n'
-            f'_orig_id = commit.original_id.decode() if commit.original_id else None\n'
-            f'if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):\n'
-            f'    if "message" in _CHANGES:\n'
-            f'        commit.message = _CHANGES["message"].encode()\n'
-            f'    if "author_name" in _CHANGES:\n'
-            f'        commit.author_name = _CHANGES["author_name"].encode()\n'
-            f'    if "author_email" in _CHANGES:\n'
-            f'        commit.author_email = _CHANGES["author_email"].encode()\n'
-            f'    if "author_name" in _CHANGES:\n'
-            f'        commit.committer_name = _CHANGES["author_name"].encode()\n'
-            f'    if "author_email" in _CHANGES:\n'
-            f'        commit.committer_email = _CHANGES["author_email"].encode()'
+        callback_code = self._build_callback(
+            {"_PAYLOAD": {"target": commit_hash, "changes": changes}},
+            _REWRITE_SINGLE_BODY,
         )
 
         result = self._run_filter_repo(
@@ -800,7 +840,7 @@ class GitFilterRepoAdapter:
 
     def get_file_history(self, file_path: str) -> list[dict]:
         """Get commit history for a specific file."""
-        self._validate_ref(file_path)
+        self._validate_paths([file_path])
         sep = self._FIELD_SEP
         history = []
         for line in _parse_lines(self._run_git("log", "--follow", f"--format=%H{sep}%an{sep}%ae{sep}%s{sep}%aI", "--", file_path).stdout):
@@ -891,11 +931,8 @@ class GitFilterRepoAdapter:
 
         safe_old_text = re.escape(old_text).replace("==>", "\\=\\=\\>")
         safe_new_text = new_text.replace("==>", "\\=\\=\\>")
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write(f"regex:{safe_old_text}==>{safe_new_text}\n")
-            expressions_path = f.name
-
-        try:
+        expression = f"regex:{safe_old_text}==>{safe_new_text}\n"
+        with _temp_file(expression, ".txt") as expressions_path:
             args = ["--replace-text", expressions_path]
             if file_pattern:
                 args.extend(["--path-glob", file_pattern])
@@ -903,8 +940,6 @@ class GitFilterRepoAdapter:
             if result.returncode != 0:
                 return FilterResult(success=False, message="Failed to replace text", error=result.stderr)
             return FilterResult(success=True, message="Replaced text in history")
-        finally:
-            Path(expressions_path).unlink(missing_ok=True)
 
     _TIME_RANGE_PRESETS = {
         "evening": (19, 0, 23, 0),
@@ -948,6 +983,66 @@ class GitFilterRepoAdapter:
             error="Use preset (evening, night, weekend, random) or custom format 'HH:MM-HH:MM'",
         )
 
+    @staticmethod
+    def _pick_random_time(
+        start_hour: int, start_min: int, end_hour: int, end_min: int,
+    ) -> tuple[int, int, int]:
+        """Pick a random (hour, minute, second) inside the given range.
+
+        Handles wrap-around ranges (e.g. 22:00-02:00) by uniformly choosing
+        between the pre-midnight and post-midnight halves.
+        """
+        second = random.randint(0, 59)
+        if end_hour >= start_hour:
+            hour = random.randint(start_hour, end_hour)
+            if hour == start_hour == end_hour:
+                minute = random.randint(start_min, end_min)
+            elif hour == end_hour:
+                minute = random.randint(0, end_min)
+            elif hour == start_hour:
+                minute = random.randint(start_min, 59)
+            else:
+                minute = random.randint(0, 59)
+        else:
+            # Wrap-around range
+            if random.random() < 0.5:
+                hour = random.randint(start_hour, 23)
+                minute = random.randint(start_min, 59) if hour == start_hour else random.randint(0, 59)
+            else:
+                hour = random.randint(0, end_hour)
+                minute = random.randint(0, end_min) if hour == end_hour else random.randint(0, 59)
+        return hour, minute, second
+
+    @staticmethod
+    def _compose_datetime(
+        current_date: datetime.datetime, hour: int, minute: int, second: int,
+        start_hour: int, end_hour: int,
+    ) -> datetime.datetime:
+        """Place (hour, minute, second) onto current_date's day, advancing to
+        the next day for wrap-around early-morning hours so the timestamp
+        doesn't land before current_date.
+        """
+        day_offset = 1 if (end_hour < start_hour and hour <= end_hour) else 0
+        return (current_date + datetime.timedelta(days=day_offset)).replace(
+            hour=hour, minute=minute, second=second, microsecond=0,
+        )
+
+    @staticmethod
+    def _parse_start_date(start_date: str | None, fallback: datetime.datetime) -> datetime.datetime | FilterResult:
+        """Parse a YYYY-MM-DD start_date, returning fallback if not provided."""
+        if not start_date:
+            return fallback
+        try:
+            return datetime.datetime.strptime(start_date, "%Y-%m-%d").replace(
+                tzinfo=datetime.timezone.utc,
+            )
+        except ValueError:
+            return FilterResult(
+                success=False,
+                message=f"Invalid start_date format: {start_date}",
+                error="Use YYYY-MM-DD format",
+            )
+
     def _generate_date_mappings(
         self,
         commits: list[CommitInfo],
@@ -968,111 +1063,74 @@ class GitFilterRepoAdapter:
             {commit_hash: (unix_timestamp, tz_offset_str)} on success,
             or FilterResult on validation error (e.g. bad start_date).
         """
-
-        commit_dates = []
+        commit_dates: list[tuple[str, datetime.datetime]] = []
         for commit in commits:
             try:
                 orig_dt = datetime.datetime.fromisoformat(commit.date.replace("Z", "+00:00"))
                 commit_dates.append((commit.hash, orig_dt))
             except ValueError:
                 continue
-
         commit_dates.sort(key=lambda x: x[1])
 
-        if start_date:
-            try:
-                base_date = datetime.datetime.strptime(start_date, "%Y-%m-%d").replace(
-                    tzinfo=datetime.timezone.utc,
-                )
-            except ValueError:
-                return FilterResult(
-                    success=False,
-                    message=f"Invalid start_date format: {start_date}",
-                    error="Use YYYY-MM-DD format",
-                )
-        else:
-            base_date = commit_dates[0][1] if commit_dates else datetime.datetime.now(datetime.timezone.utc)
+        default_base = commit_dates[0][1] if commit_dates else datetime.datetime.now(datetime.timezone.utc)
+        base = self._parse_start_date(start_date, default_base)
+        if isinstance(base, FilterResult):
+            return base
 
         date_mappings: dict[str, tuple[int, str]] = {}
-        current_date = base_date
-        prev_timestamp = None
+        current_date = base
+        prev_timestamp: datetime.datetime | None = None
 
         for commit_hash, orig_dt in commit_dates:
             tz_offset = orig_dt.strftime("%z") or "+0000"
 
             new_dt = current_date  # default in case all 100 attempts fail
             found_valid = False
+            hour = minute = second = 0  # last picked values (used by preserve_order)
             for _ in range(100):
-                if end_hour >= start_hour:
-                    hour = random.randint(start_hour, end_hour)
-                    if hour == start_hour == end_hour:
-                        minute = random.randint(start_min, end_min)
-                    elif hour == end_hour:
-                        minute = random.randint(0, end_min)
-                    elif hour == start_hour:
-                        minute = random.randint(start_min, 59)
-                    else:
-                        minute = random.randint(0, 59)
-                else:
-                    # Wrap-around range (e.g., 22:00-02:00)
-                    if random.random() < 0.5:
-                        hour = random.randint(start_hour, 23)
-                        minute = random.randint(start_min, 59) if hour == start_hour else random.randint(0, 59)
-                    else:
-                        hour = random.randint(0, end_hour)
-                        minute = random.randint(0, end_min) if hour == end_hour else random.randint(0, 59)
-
-                second = random.randint(0, 59)
-                new_dt = current_date.replace(hour=hour, minute=minute, second=second, microsecond=0)
+                hour, minute, second = self._pick_random_time(
+                    start_hour, start_min, end_hour, end_min,
+                )
+                new_dt = self._compose_datetime(
+                    current_date, hour, minute, second, start_hour, end_hour,
+                )
 
                 if weekend_only and new_dt.weekday() < 5:
-                    days_until_saturday = 5 - new_dt.weekday()
-                    current_date = current_date + datetime.timedelta(days=days_until_saturday)
+                    current_date += datetime.timedelta(days=5 - new_dt.weekday())
                     continue
-
-                if preserve_order and prev_timestamp:
-                    if new_dt <= prev_timestamp:
-                        new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 60))
-                        if weekend_only and new_dt.weekday() < 5:
-                            new_dt += datetime.timedelta(days=5 - new_dt.weekday())
-                        new_dt = new_dt.replace(hour=hour, minute=minute, second=second)
-                        if new_dt <= prev_timestamp:
-                            new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(1, 10))
-                        current_date = new_dt
 
                 found_valid = True
                 break
 
-            if not found_valid:
-                if prev_timestamp:
-                    new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 30))
+            if preserve_order and prev_timestamp and new_dt <= prev_timestamp:
+                new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 60))
+                if weekend_only and new_dt.weekday() < 5:
+                    new_dt += datetime.timedelta(days=5 - new_dt.weekday())
+                new_dt = new_dt.replace(hour=hour, minute=minute, second=second)
+                if new_dt <= prev_timestamp:
+                    new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(1, 10))
+                current_date = new_dt
+
+            if not found_valid and prev_timestamp:
+                new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 30))
 
             date_mappings[commit_hash] = (int(new_dt.timestamp()), tz_offset)
             prev_timestamp = new_dt
 
             if random.random() < DATE_ADVANCE_PROBABILITY:
-                current_date = current_date + datetime.timedelta(days=1)
+                current_date += datetime.timedelta(days=1)
 
         return date_mappings
 
     def _create_date_callback_code(self, date_mappings: dict[str, tuple[int, str]]) -> str:
         """Build git-filter-repo --commit-callback code for date rewriting.
 
-        The generated code is exec'd by git-filter-repo with `commit` in scope.
-        It looks up commit.original_id in a base64-encoded date mapping dict.
+        The generated code is exec'd by git-filter-repo with ``commit`` in
+        scope. It looks up ``commit.original_id`` in a JSON-encoded date
+        mapping dict.
         """
         serializable = {h: [ts, tz] for h, (ts, tz) in date_mappings.items()}
-        encoded = self._encode_callback_data(serializable)
-
-        return (
-            self._callback_preamble(encoded, '_DATE_MAP') +
-            '_commit_hash = commit.original_id.decode() if commit.original_id else None\n'
-            'if _commit_hash and _commit_hash in _DATE_MAP:\n'
-            '    _new_ts, _tz_offset = _DATE_MAP[_commit_hash]\n'
-            '    _new_date = f"{_new_ts} {_tz_offset}".encode()\n'
-            '    commit.author_date = _new_date\n'
-            '    commit.committer_date = _new_date'
-        )
+        return self._build_callback({"_DATE_MAP": serializable}, _DATE_REWRITE_BODY)
 
     def change_commit_dates(
         self,
@@ -1102,9 +1160,13 @@ class GitFilterRepoAdapter:
             return parsed
         start_hour, start_min, end_hour, end_min = parsed
 
+        # The "weekend" preset implies weekend-only days; otherwise the name
+        # is misleading because it would also place commits on weekdays.
+        effective_weekend_only = weekend_only or time_range == "weekend"
+
         mappings = self._generate_date_mappings(
             commits, start_hour, start_min, end_hour, end_min,
-            weekend_only, preserve_order, start_date,
+            effective_weekend_only, preserve_order, start_date,
         )
         if isinstance(mappings, FilterResult):
             return mappings

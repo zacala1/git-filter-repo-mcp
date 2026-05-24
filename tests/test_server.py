@@ -1,7 +1,25 @@
-"""Tests for MCP server."""
+"""Tests for the MCP server layer.
+
+These tests exercise the handler layer in isolation: ``GitFilterRepoAdapter``
+is always mocked so we never spawn subprocesses or touch the filesystem.
+
+Organisation:
+
+- **Pure helpers** (no patching): ``result_to_dict``, pydantic input models.
+- **Protocol layer**: ``list_tools``, ``call_tool``, ``_execute_tool`` dispatch.
+- **Per-tool handlers**: one class per MCP tool covering happy path,
+  dry-run, validation, and backup behaviour.
+- **Cross-cutting**: auto-backup, AI provider plumbing, error envelopes,
+  ``main()`` lifecycle.
+
+Common fixtures (``patched_adapter``) and factories (``make_fr``, ``make_ci``)
+collapse the otherwise-verbose ``patch + MagicMock + side_effect`` ritual.
+"""
 
 import json
-from unittest.mock import MagicMock, patch
+import subprocess as sp
+from typing import Any, Iterator
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -12,958 +30,690 @@ from git_filter_repo_mcp.server import (
     list_tools,
     result_to_dict,
 )
-from git_filter_repo_mcp.tools import ErrorCode
+from git_filter_repo_mcp.tools import (
+    AnalyzeHistoryInput,
+    RemoveLargeFilesInput,
+    RewriteCommitMessagesInput,
+    ErrorCode,
+)
+
+
+# =========================================================================
+# Helpers & fixtures
+# =========================================================================
+
+
+def make_fr(**kwargs: Any) -> FilterResult:
+    """``FilterResult`` factory with sensible defaults — tests only set what
+    they care about. Replaces dozens of inline 7-line constructors."""
+    defaults: dict[str, Any] = {
+        "success": True,
+        "message": "ok",
+        "commits_processed": 0,
+        "commits_rewritten": 0,
+        "files_affected": [],
+        "dry_run": False,
+        "error": None,
+    }
+    defaults.update(kwargs)
+    return FilterResult(**defaults)
+
+
+def make_ci(hash_: str = "abc123def456", message: str = "msg") -> CommitInfo:
+    """Concise ``CommitInfo`` factory for handler tests."""
+    return CommitInfo(
+        hash=hash_,
+        author_name="Test User", author_email="test@example.com",
+        committer_name="Test User", committer_email="test@example.com",
+        message=message, date="2024-12-09",
+    )
+
+
+@pytest.fixture
+def patched_adapter() -> Iterator[MagicMock]:
+    """Patch ``server.GitFilterRepoAdapter`` and yield the mock instance.
+
+    Every server handler instantiates ``GitFilterRepoAdapter(repo_path)``, so
+    tests almost always need this. Yielding the *instance* (not the class)
+    lets tests set up methods directly: ``patched_adapter.get_commits.return_value = [...]``.
+    """
+    with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
+        instance = MagicMock()
+        MockAdapter.return_value = instance
+        yield instance
+
+
+# =========================================================================
+# Pure helpers — no patching needed
+# =========================================================================
 
 
 class TestResultToDict:
-    """Test result_to_dict conversion."""
+    """``result_to_dict`` serialises a ``FilterResult`` for transport."""
 
-    def test_success_result(self):
-        result = FilterResult(
-            success=True,
-            message="Operation completed",
-            commits_processed=10,
-            commits_rewritten=5,
-            files_affected=["a.py", "b.py"],
-            dry_run=False,
-            error=None,
+    def test_round_trip_preserves_every_field(self) -> None:
+        result = make_fr(
+            success=True, message="Operation completed",
+            commits_processed=10, commits_rewritten=5,
+            files_affected=["a.py", "b.py"], dry_run=False, error=None,
         )
         d = result_to_dict(result)
-        assert d["success"] is True
-        assert d["message"] == "Operation completed"
-        assert d["commits_processed"] == 10
-        assert d["commits_rewritten"] == 5
-        assert d["files_affected"] == ["a.py", "b.py"]
-        assert d["dry_run"] is False
-        assert d["error"] is None
+        assert d == {
+            "success": True,
+            "message": "Operation completed",
+            "commits_processed": 10,
+            "commits_rewritten": 5,
+            "files_affected": ["a.py", "b.py"],
+            "dry_run": False,
+            "error": None,
+        }
 
-    def test_error_result(self):
-        result = FilterResult(
-            success=False,
-            message="",
-            commits_processed=0,
-            commits_rewritten=0,
-            files_affected=[],
-            dry_run=False,
-            error="Something went wrong",
-        )
-        d = result_to_dict(result)
-        assert d["success"] is False
-        assert d["error"] == "Something went wrong"
+    @pytest.mark.parametrize(
+        "kwargs,key,expected",
+        [
+            ({"success": False, "error": "Something went wrong"}, "error", "Something went wrong"),
+            ({"dry_run": True}, "dry_run", True),
+        ],
+    )
+    def test_selected_field(self, kwargs: dict, key: str, expected: Any) -> None:
+        assert result_to_dict(make_fr(**kwargs))[key] == expected
 
-    def test_dry_run_result(self):
-        result = FilterResult(
-            success=True,
-            message="Dry run completed",
-            commits_processed=5,
-            commits_rewritten=0,
-            files_affected=[],
-            dry_run=True,
-            error=None,
-        )
-        d = result_to_dict(result)
-        assert d["dry_run"] is True
+
+class TestPydanticInputValidation:
+    """Input-model constraints baked into ``tools.py`` (pure pydantic)."""
+
+    @pytest.mark.parametrize(
+        "model,kwargs",
+        [
+            (AnalyzeHistoryInput, {"repo_path": "/tmp", "max_count": 0}),
+            (AnalyzeHistoryInput, {"repo_path": "/tmp", "max_count": -1}),
+            (AnalyzeHistoryInput, {"repo_path": "/tmp", "max_count": 20000}),
+            (RemoveLargeFilesInput, {"repo_path": "/tmp", "size_threshold_mb": 0.0}),
+            (RemoveLargeFilesInput, {"repo_path": "/tmp", "size_threshold_mb": -5.0}),
+        ],
+    )
+    def test_out_of_range_rejected(self, model: type, kwargs: dict) -> None:
+        with pytest.raises(Exception):  # pydantic.ValidationError
+            model(**kwargs)
+
+    def test_rewrite_messages_defaults(self) -> None:
+        params = RewriteCommitMessagesInput(repo_path="/tmp")
+        assert params.use_ai is False
+        assert params.ai_provider is None
+        assert params.dry_run is True
+        assert params.style == "conventional"
+
+    @pytest.mark.parametrize("style", ["conventional", "gitmoji", "simple", "detailed"])
+    def test_all_valid_styles_accepted(self, style: str) -> None:
+        params = RewriteCommitMessagesInput(repo_path="/tmp", style=style)  # type: ignore[arg-type]
+        assert params.style == style
+
+
+# =========================================================================
+# Protocol layer — list_tools, call_tool, _execute_tool dispatch
+# =========================================================================
 
 
 class TestListTools:
-    """Test list_tools handler."""
+    """``list_tools`` produces the MCP-shaped tool list."""
 
-    @pytest.mark.asyncio
-    async def test_list_tools_returns_tools(self):
+    async def test_includes_known_tools_with_required_fields(self) -> None:
         tools = await list_tools()
-        assert len(tools) > 0
-
-        # Check that essential tools are present
-        tool_names = [t.name for t in tools]
-        assert "analyze_git_history" in tool_names
-        assert "rewrite_commit_messages" in tool_names
-        assert "change_author" in tool_names
-        assert "remove_files_from_history" in tool_names
-        assert "create_backup" in tool_names
-
-    @pytest.mark.asyncio
-    async def test_tools_have_required_fields(self):
-        tools = await list_tools()
+        names = {t.name for t in tools}
+        # Spot-check critical ones — full set is asserted by test_tools.py.
+        assert {
+            "analyze_git_history", "rewrite_commit_messages",
+            "change_author", "create_backup",
+        } <= names
         for tool in tools:
-            assert tool.name is not None
-            assert tool.description is not None
-            assert tool.inputSchema is not None
+            assert tool.name and tool.description and tool.inputSchema is not None
 
 
 class TestCallTool:
-    """Test call_tool handler."""
+    """``call_tool`` envelopes the handler output as ``TextContent``."""
 
-    @pytest.mark.asyncio
-    async def test_call_tool_returns_text_content(self):
-        with patch("git_filter_repo_mcp.server._execute_tool") as mock_execute:
-            mock_execute.return_value = {"success": True, "message": "Done"}
+    async def test_wraps_success(self) -> None:
+        with patch("git_filter_repo_mcp.server._execute_tool",
+                   AsyncMock(return_value={"success": True, "message": "Done"})):
+            result = await call_tool("analyze_git_history", {"repo_path": "/tmp"})
+        assert len(result) == 1 and result[0].type == "text"
+        assert json.loads(result[0].text)["success"] is True
 
-            result = await call_tool("analyze_git_history", {"repo_path": "/tmp/repo"})
-
-            assert len(result) == 1
-            assert result[0].type == "text"
-            data = json.loads(result[0].text)
-            assert data["success"] is True
-
-    @pytest.mark.asyncio
-    async def test_call_tool_handles_errors(self):
-        with patch("git_filter_repo_mcp.server._execute_tool") as mock_execute:
-            mock_execute.side_effect = ValueError("Test error")
-
-            result = await call_tool("analyze_git_history", {"repo_path": "/tmp/repo"})
-
-            assert len(result) == 1
-            data = json.loads(result[0].text)
-            assert data["success"] is False
-            assert "Test error" in data["error"]
+    async def test_wraps_unexpected_exception(self) -> None:
+        with patch("git_filter_repo_mcp.server._execute_tool",
+                   AsyncMock(side_effect=ValueError("Test error"))):
+            result = await call_tool("analyze_git_history", {"repo_path": "/tmp"})
+        data = json.loads(result[0].text)
+        assert data["success"] is False
+        assert "Test error" in data["error"]
 
 
-class TestExecuteTool:
-    """Test _execute_tool function."""
+class TestExecuteToolDispatch:
+    """Cross-cutting behaviour of ``_execute_tool`` itself."""
 
-    @pytest.mark.asyncio
-    async def test_unknown_tool(self):
+    async def test_unknown_tool_returns_tool_not_found(self) -> None:
         result = await _execute_tool("unknown_tool", {})
-        assert "error" in result
-        assert "Unknown tool" in result["error"]
         assert result["error_code"] == ErrorCode.TOOL_NOT_FOUND
+        assert "Unknown tool" in result["error"]
 
-    @pytest.mark.asyncio
-    async def test_analyze_git_history(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.analyze_history.return_value = {
-                "total_commits": 10,
-                "authors": ["test@example.com"],
-                "branches": ["main"],
-            }
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "analyze_git_history",
-                {
-                    "repo_path": "/tmp/repo",
-                    "branch": "main",
-                    "max_count": 50,
-                },
-            )
-
-            assert result["success"] is True
-            assert result["total_commits"] == 10
-            mock_adapter.analyze_history.assert_called_once_with("main", 50)
-
-    @pytest.mark.asyncio
-    async def test_create_backup(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.create_backup.return_value = "backup-20241209-123456"
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool("create_backup", {"repo_path": "/tmp/repo"})
-
-            assert result["success"] is True
-            assert result["backup_branch"] == "backup-20241209-123456"
-            mock_adapter.create_backup.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_restore_backup(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.restore_backup.return_value = FilterResult(
-                success=True,
-                message="Restored from backup",
-                commits_processed=0,
-                commits_rewritten=0,
-                files_affected=[],
-                dry_run=False,
-                error=None,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "restore_backup",
-                {
-                    "repo_path": "/tmp/repo",
-                    "backup_branch": "backup-20241209-123456",
-                },
-            )
-
-            assert result["success"] is True
-            mock_adapter.restore_backup.assert_called_once_with("backup-20241209-123456")
-
-    @pytest.mark.asyncio
-    async def test_change_author_dry_run(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.change_author.return_value = FilterResult(
-                success=True,
-                message="Would change 5 commits",
-                commits_processed=5,
-                commits_rewritten=0,
-                files_affected=[],
-                dry_run=True,
-                error=None,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "change_author",
-                {
-                    "repo_path": "/tmp/repo",
-                    "old_email": "old@example.com",
-                    "new_name": "New Name",
-                    "new_email": "new@example.com",
-                    "dry_run": True,
-                },
-            )
-
-            assert result["success"] is True
-            assert result["dry_run"] is True
-            mock_adapter.change_author.assert_called_once_with(
-                "old@example.com", "New Name", "new@example.com", True, False
-            )
-
-    @pytest.mark.asyncio
-    async def test_remove_files_from_history(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.remove_files.return_value = FilterResult(
-                success=True,
-                message="Removed files",
-                commits_processed=10,
-                commits_rewritten=3,
-                files_affected=["secret.txt"],
-                dry_run=False,
-                error=None,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "remove_files_from_history",
-                {
-                    "repo_path": "/tmp/repo",
-                    "paths": ["secret.txt", "config.json"],
-                    "dry_run": False,
-                },
-            )
-
-            assert result["success"] is True
-            assert result["files_affected"] == ["secret.txt"]
-
-    @pytest.mark.asyncio
-    async def test_get_commit_details(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            from git_filter_repo_mcp.adapter import CommitInfo
-
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo(
-                    hash="abc123def456",
-                    author_name="Test User",
-                    author_email="test@example.com",
-                    committer_name="Test User",
-                    committer_email="test@example.com",
-                    message="Test commit",
-                    date="2024-12-09",
-                )
-            ]
-            mock_adapter.get_commit_files.return_value = ["file1.py", "file2.py"]
-            mock_adapter.get_commit_diff.return_value = "+ added line\n- removed line"
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "get_commit_details",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "abc123",
-                },
-            )
-
-            assert result["success"] is True
-            assert result["commit"]["hash"] == "abc123def456"
-            assert result["commit"]["author_name"] == "Test User"
-            assert result["commit"]["files"] == ["file1.py", "file2.py"]
-
-    @pytest.mark.asyncio
-    async def test_get_commit_details_not_found(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = []
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "get_commit_details",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "nonexistent",
-                },
-            )
-
-            assert "error" in result
-            assert "not found" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_scan_secrets(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.scan_secrets.return_value = {
-                "findings": [],
-                "files_scanned": 50,
-                "commits_scanned": 10,
-            }
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "scan_secrets",
-                {
-                    "repo_path": "/tmp/repo",
-                    "branch": "main",
-                    "max_commits": 50,
-                },
-            )
-
-            assert result["success"] is True
-            assert result["findings"] == []
-            mock_adapter.scan_secrets.assert_called_once_with("main", 50)
-
-    @pytest.mark.asyncio
-    async def test_list_all_files_in_history(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.list_all_files_in_history.return_value = [
-                "file1.py",
-                "file2.py",
-                "dir/file3.py",
-            ]
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "list_all_files_in_history",
-                {
-                    "repo_path": "/tmp/repo",
-                },
-            )
-
-            assert result["success"] is True
-            assert result["total_files"] == 3
-            assert "file1.py" in result["files"]
-
-    @pytest.mark.asyncio
-    async def test_get_file_history(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_file_history.return_value = [
-                {"hash": "abc123", "message": "Add file"},
-                {"hash": "def456", "message": "Update file"},
-            ]
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "get_file_history",
-                {
-                    "repo_path": "/tmp/repo",
-                    "file_path": "src/main.py",
-                },
-            )
-
-            assert result["success"] is True
-            assert result["total_commits"] == 2
-            mock_adapter.get_file_history.assert_called_once_with("src/main.py")
-
-
-class TestRewriteCommitMessages:
-    """Test rewrite_commit_messages tool."""
-
-    @pytest.mark.asyncio
-    async def test_manual_mappings_dry_run(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.rewrite_commit_messages.return_value = FilterResult(
-                success=True,
-                message="Would rewrite 2 commits",
-                commits_processed=5,
-                commits_rewritten=0,
-                files_affected=[],
-                dry_run=True,
-                error=None,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_commit_messages",
-                {
-                    "repo_path": "/tmp/repo",
-                    "use_ai": False,
-                    "manual_mappings": {
-                        "old message 1": "new message 1",
-                        "old message 2": "new message 2",
-                    },
-                    "dry_run": True,
-                },
-            )
-
-            assert result["success"] is True
-            assert result["dry_run"] is True
-
-    @pytest.mark.asyncio
-    async def test_no_ai_no_mappings_error(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            MockAdapter.return_value = MagicMock()
-
-            result = await _execute_tool(
-                "rewrite_commit_messages",
-                {
-                    "repo_path": "/tmp/repo",
-                    "use_ai": False,
-                },
-            )
-
-            assert "error" in result
-            assert "manual_mappings" in result["error"]
-            assert result["error_code"] == ErrorCode.INVALID_INPUT
-
-
-class TestValidationErrorHandling:
-    """Test that Pydantic validation errors return useful messages."""
-
-    @pytest.mark.asyncio
-    async def test_missing_required_field(self):
-        result = await _execute_tool("analyze_git_history", {})
+    @pytest.mark.parametrize(
+        "tool,args,error_fragment",
+        [
+            ("analyze_git_history", {}, "repo_path"),
+            ("analyze_git_history",
+             {"repo_path": "/tmp/repo", "max_count": "not_a_number"}, "Invalid input"),
+            ("change_author", {"repo_path": "/tmp/repo"}, "Invalid input"),
+        ],
+    )
+    async def test_pydantic_errors_propagated(
+        self, tool: str, args: dict, error_fragment: str,
+    ) -> None:
+        result = await _execute_tool(tool, args)
         assert result["success"] is False
-        assert "Invalid input" in result["error"]
-        assert "repo_path" in result["error"]
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+        assert error_fragment in result["error"]
+
+
+# =========================================================================
+# Read-only handlers
+# =========================================================================
+
+
+class TestAnalyzeHistoryHandler:
+    async def test_forwards_args_and_merges_response(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        patched_adapter.analyze_history.return_value = {
+            "total_commits": 10, "authors": ["test@example.com"], "branches": ["main"],
+        }
+        result = await _execute_tool("analyze_git_history", {
+            "repo_path": "/tmp/repo", "branch": "main", "max_count": 50,
+        })
+        assert result["success"] is True
+        assert result["total_commits"] == 10
+        patched_adapter.analyze_history.assert_called_once_with("main", 50)
+
+
+class TestGetCommitDetailsHandler:
+    async def test_returns_full_commit(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.get_commits.return_value = [make_ci("abc123def456", "Test commit")]
+        patched_adapter.get_commit_files.return_value = ["file1.py", "file2.py"]
+        patched_adapter.get_commit_diff.return_value = "+ added\n- removed"
+
+        result = await _execute_tool("get_commit_details", {
+            "repo_path": "/tmp/repo", "commit_hash": "abc123",
+        })
+        assert result["success"] is True
+        assert result["commit"]["hash"] == "abc123def456"
+        assert result["commit"]["files"] == ["file1.py", "file2.py"]
+
+    async def test_not_found(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.get_commits.return_value = []
+        result = await _execute_tool("get_commit_details", {
+            "repo_path": "/tmp/repo", "commit_hash": "nonexistent",
+        })
+        assert result["success"] is False
+        assert "not found" in result["error"]
+
+    async def test_dash_hash_rejected(self) -> None:
+        """Hash sanitisation happens in the handler — no adapter needed."""
+        result = await _execute_tool("get_commit_details", {
+            "repo_path": "/tmp/repo", "commit_hash": "--exec=evil",
+        })
+        assert result["success"] is False
         assert result["error_code"] == ErrorCode.INVALID_INPUT
 
-    @pytest.mark.asyncio
-    async def test_wrong_type(self):
-        result = await _execute_tool(
-            "analyze_git_history",
-            {"repo_path": "/tmp/repo", "max_count": "not_a_number"},
+
+class TestScanSecretsHandler:
+    async def test_passes_through(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.scan_secrets.return_value = {
+            "findings": [], "files_scanned": 50, "commits_scanned": 10,
+        }
+        result = await _execute_tool("scan_secrets", {
+            "repo_path": "/tmp/repo", "branch": "main", "max_commits": 50,
+        })
+        assert result["success"] is True
+        patched_adapter.scan_secrets.assert_called_once_with("main", 50)
+
+    async def test_empty_repo(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.scan_secrets.return_value = {
+            "commits_scanned": 0, "secrets_found": 0, "sensitive_files": 0,
+            "findings": [], "sensitive_file_list": [], "files_scanned": 0,
+        }
+        result = await _execute_tool("scan_secrets", {"repo_path": "/tmp/repo"})
+        assert result["success"] is True
+        assert result["secrets_found"] == 0
+
+
+class TestListAllFilesHandler:
+    async def test_summary(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.list_all_files_in_history.return_value = [
+            "file1.py", "file2.py", "dir/file3.py",
+        ]
+        result = await _execute_tool("list_all_files_in_history", {"repo_path": "/tmp/repo"})
+        assert result["total_files"] == 3
+        assert "file1.py" in result["files"]
+
+
+class TestGetFileHistoryHandler:
+    async def test_summary(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.get_file_history.return_value = [
+            {"hash": "abc", "message": "Add"}, {"hash": "def", "message": "Update"},
+        ]
+        result = await _execute_tool("get_file_history", {
+            "repo_path": "/tmp/repo", "file_path": "src/main.py",
+        })
+        assert result["total_commits"] == 2
+        patched_adapter.get_file_history.assert_called_once_with("src/main.py")
+
+
+# =========================================================================
+# Backup handlers
+# =========================================================================
+
+
+class TestBackupHandlers:
+    async def test_create_backup(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.create_backup.return_value = "backup-20241209-123456"
+        result = await _execute_tool("create_backup", {"repo_path": "/tmp/repo"})
+        assert result["backup_branch"] == "backup-20241209-123456"
+
+    async def test_restore_backup(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.restore_backup.return_value = make_fr(message="Restored")
+        result = await _execute_tool("restore_backup", {
+            "repo_path": "/tmp/repo", "backup_branch": "backup-20241209-123456",
+        })
+        assert result["success"] is True
+        patched_adapter.restore_backup.assert_called_once_with("backup-20241209-123456")
+
+
+# =========================================================================
+# Destructive handlers
+# =========================================================================
+
+
+class TestChangeAuthorHandler:
+    async def test_dry_run_forwards_args(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.change_author.return_value = make_fr(
+            message="Would change 5", commits_processed=5, dry_run=True,
         )
-        assert result["success"] is False
-        assert "Invalid input" in result["error"]
-        assert result["error_code"] == ErrorCode.INVALID_INPUT
-
-    @pytest.mark.asyncio
-    async def test_missing_required_field_change_author(self):
-        result = await _execute_tool(
-            "change_author",
-            {"repo_path": "/tmp/repo"},
+        result = await _execute_tool("change_author", {
+            "repo_path": "/tmp/repo",
+            "old_email": "old@example.com",
+            "new_name": "New Name",
+            "new_email": "new@example.com",
+            "dry_run": True,
+        })
+        assert result["success"] and result["dry_run"]
+        patched_adapter.change_author.assert_called_once_with(
+            "old@example.com", "New Name", "new@example.com", True, False,
         )
-        assert result["success"] is False
-        assert "Invalid input" in result["error"]
-        assert result["error_code"] == ErrorCode.INVALID_INPUT
 
 
-class TestRewriteSingleCommit:
-    """Test rewrite_single_commit tool."""
-
-    @pytest.mark.asyncio
-    async def test_no_changes_returns_error(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo(
-                    hash="abc123def456",
-                    author_name="Test",
-                    author_email="test@example.com",
-                    committer_name="Test",
-                    committer_email="test@example.com",
-                    message="Original message",
-                    date="2024-12-09",
-                )
-            ]
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_single_commit",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "abc123",
-                    "dry_run": False,
-                },
-            )
-
-            assert result["success"] is False
-            assert "No changes specified" in result["error"]
-            assert result["error_code"] == ErrorCode.NO_CHANGES
-
-    @pytest.mark.asyncio
-    async def test_dry_run_shows_changes(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo(
-                    hash="abc123def456",
-                    author_name="Test",
-                    author_email="test@example.com",
-                    committer_name="Test",
-                    committer_email="test@example.com",
-                    message="Original message",
-                    date="2024-12-09",
-                )
-            ]
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_single_commit",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "abc123",
-                    "new_message": "New message",
-                    "dry_run": True,
-                },
-            )
-
-            assert result["success"] is True
-            assert result["dry_run"] is True
-            assert result["new_message"] == "New message"
-
-    @pytest.mark.asyncio
-    async def test_commit_not_found(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = []
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_single_commit",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "nonexistent",
-                    "new_message": "New message",
-                },
-            )
-
-            assert result["success"] is False
-            assert "not found" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_message_change_calls_adapter(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo(
-                    hash="abc123def456",
-                    author_name="Test",
-                    author_email="test@example.com",
-                    committer_name="Test",
-                    committer_email="test@example.com",
-                    message="Old message",
-                    date="2024-12-09",
-                )
-            ]
-            mock_adapter.rewrite_single_commit.return_value = FilterResult(
-                success=True,
-                message="Updated commit abc123de: message",
-                commits_rewritten=1,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_single_commit",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "abc123",
-                    "new_message": "New message",
-                    "dry_run": False,
-                },
-            )
-
-            assert result["success"] is True
-            mock_adapter.rewrite_single_commit.assert_called_once_with(
-                "abc123",
-                new_message="New message",
-                new_author_name=None,
-                new_author_email=None,
-            )
-
-
-class TestFilterPaths:
-    """Test filter_paths tool."""
-
-    @pytest.mark.asyncio
-    async def test_include_exclude_together_rejected(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.filter_paths.return_value = FilterResult(
-                success=False,
-                message="Cannot use include_paths and exclude_paths together",
-                error="git-filter-repo's --invert-paths is global",
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "filter_paths",
-                {
-                    "repo_path": "/tmp/repo",
-                    "include_paths": ["src/"],
-                    "exclude_paths": ["tests/"],
-                    "dry_run": True,
-                },
-            )
-
-            assert result["success"] is False
-
-    @pytest.mark.asyncio
-    async def test_replace_text_dry_run(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.replace_text_in_history.return_value = FilterResult(
-                success=True,
-                message="Dry run: 3 files in history",
-                files_affected=["a.py", "b.py", "c.py"],
-                dry_run=True,
-            )
-            mock_adapter.create_backup.return_value = "backup_123"
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "replace_text_in_history",
-                {
-                    "repo_path": "/tmp/repo",
-                    "old_text": "old_value",
-                    "new_text": "new_value",
-                    "dry_run": True,
-                },
-            )
-
-            assert result["success"] is True
-            assert result["dry_run"] is True
+class TestRemoveFilesHandler:
+    async def test_forwards_paths(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.remove_files.return_value = make_fr(
+            commits_rewritten=3, files_affected=["secret.txt"],
+        )
+        result = await _execute_tool("remove_files_from_history", {
+            "repo_path": "/tmp/repo",
+            "paths": ["secret.txt", "config.json"],
+            "dry_run": False,
+        })
+        assert result["files_affected"] == ["secret.txt"]
 
 
 class TestRemoveLargeFilesHandler:
-    """Test remove_large_files handler."""
+    async def test_dry_run_forwards_threshold(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.remove_large_files.return_value = make_fr(
+            files_affected=["big.bin", "huge.zip"], dry_run=True,
+        )
+        result = await _execute_tool("remove_large_files", {
+            "repo_path": "/tmp/repo", "size_threshold_mb": 10.0, "dry_run": True,
+        })
+        assert result["dry_run"] and result["files_affected"] == ["big.bin", "huge.zip"]
+        patched_adapter.remove_large_files.assert_called_once_with(10.0, True, False)
 
-    @pytest.mark.asyncio
-    async def test_dry_run(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.remove_large_files.return_value = FilterResult(
-                success=True,
-                message="Found 2 files larger than 10.0 MB",
-                commits_processed=5,
-                commits_rewritten=0,
-                files_affected=["big.bin", "huge.zip"],
-                dry_run=True,
-                error=None,
-            )
-            MockAdapter.return_value = mock_adapter
 
-            result = await _execute_tool(
-                "remove_large_files",
-                {"repo_path": "/tmp/repo", "size_threshold_mb": 10.0, "dry_run": True},
-            )
-
-            assert result["success"] is True
-            assert result["dry_run"] is True
-            assert result["files_affected"] == ["big.bin", "huge.zip"]
-            mock_adapter.remove_large_files.assert_called_once_with(10.0, True, False)
+class TestFilterPathsHandler:
+    async def test_include_and_exclude_propagates_error(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        patched_adapter.filter_paths.return_value = make_fr(
+            success=False, message="Cannot use include_paths and exclude_paths together",
+        )
+        result = await _execute_tool("filter_paths", {
+            "repo_path": "/tmp/repo",
+            "include_paths": ["src/"], "exclude_paths": ["tests/"], "dry_run": True,
+        })
+        assert result["success"] is False
 
 
 class TestSquashCommitsHandler:
-    """Test squash_commits handler."""
+    async def test_dry_run(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.squash_commits.return_value = make_fr(
+            commits_processed=3, dry_run=True,
+        )
+        result = await _execute_tool("squash_commits", {
+            "repo_path": "/tmp/repo", "start_commit": "abc123", "end_commit": "HEAD",
+            "dry_run": True,
+        })
+        assert result["dry_run"] and result["commits_processed"] == 3
 
-    @pytest.mark.asyncio
-    async def test_dry_run(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.squash_commits.return_value = FilterResult(
-                success=True,
-                message="Would squash 3 commits",
-                commits_processed=3,
-                commits_rewritten=0,
-                files_affected=[],
-                dry_run=True,
-                error=None,
-            )
-            MockAdapter.return_value = mock_adapter
+    async def test_dash_start_commit_returns_error(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        """Adapter raises ValueError; handler must surface a clean error."""
+        patched_adapter.squash_commits.side_effect = ValueError("Invalid ref")
+        result = await _execute_tool("squash_commits", {
+            "repo_path": "/tmp/repo", "start_commit": "--exec=evil", "dry_run": True,
+        })
+        assert result["success"] is False
 
-            result = await _execute_tool(
-                "squash_commits",
-                {
-                    "repo_path": "/tmp/repo",
-                    "start_commit": "abc123",
-                    "end_commit": "HEAD",
-                    "dry_run": True,
-                },
-            )
 
-            assert result["success"] is True
-            assert result["dry_run"] is True
-            assert result["commits_processed"] == 3
+class TestReplaceTextHandler:
+    async def test_dry_run(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.replace_text_in_history.return_value = make_fr(
+            files_affected=["a.py", "b.py", "c.py"], dry_run=True,
+        )
+        result = await _execute_tool("replace_text_in_history", {
+            "repo_path": "/tmp/repo", "old_text": "old_value",
+            "new_text": "new_value", "dry_run": True,
+        })
+        assert result["success"] and result["dry_run"]
 
-    @pytest.mark.asyncio
-    async def test_with_auto_backup(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server.get_config") as mock_get_config:
-            mock_get_config.return_value.server.auto_backup = True
-            mock_adapter = MagicMock()
-            mock_adapter.create_backup.return_value = "backup_squash"
-            mock_adapter.squash_commits.return_value = FilterResult(
-                success=True,
-                message="Squashed 3 commits",
-                commits_processed=3,
-                commits_rewritten=1,
-                files_affected=[],
-                dry_run=False,
-                error=None,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "squash_commits",
-                {
-                    "repo_path": "/tmp/repo",
-                    "start_commit": "abc123",
-                    "dry_run": False,
-                },
-            )
-
-            assert result["success"] is True
-            assert result["backup_branch"] == "backup_squash"
+    async def test_empty_old_text_propagates(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.replace_text_in_history.return_value = make_fr(
+            success=False, message="old_text must not be empty",
+        )
+        result = await _execute_tool("replace_text_in_history", {
+            "repo_path": "/tmp/repo", "old_text": "", "new_text": "x", "dry_run": True,
+        })
+        assert result["success"] is False
 
 
 class TestChangeDatesHandler:
-    """Test change_commit_dates handler."""
+    @pytest.mark.parametrize(
+        "extra,expected_call_args",
+        [
+            ({"time_range": "evening"},
+             ("evening", False, True, None)),
+            ({"time_range": "random", "weekend_only": True},
+             ("random", True, True, None)),
+        ],
+        ids=["evening", "weekend_only"],
+    )
+    async def test_forwards_args(
+        self, patched_adapter: MagicMock,
+        extra: dict, expected_call_args: tuple,
+    ) -> None:
+        patched_adapter.change_commit_dates.return_value = make_fr(
+            commits_rewritten=3, dry_run=True,
+        )
+        await _execute_tool("change_commit_dates", {
+            "repo_path": "/tmp/repo", "dry_run": True, **extra,
+        })
+        patched_adapter.change_commit_dates.assert_called_once_with(
+            *expected_call_args, dry_run=True, force=False,
+        )
 
-    @pytest.mark.asyncio
-    async def test_dry_run(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.change_commit_dates.return_value = FilterResult(
-                success=True,
-                message="Preview: 5 commits would be changed",
-                commits_processed=5,
-                commits_rewritten=5,
-                files_affected=[],
-                dry_run=True,
-                error=None,
+
+# =========================================================================
+# rewrite_commit_messages — combine manual_mappings / AI / errors
+# =========================================================================
+
+
+class TestRewriteCommitMessages:
+    """``rewrite_commit_messages`` has the most branches; group them here."""
+
+    async def test_manual_mappings_dry_run(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.rewrite_commit_messages.return_value = make_fr(
+            commits_processed=5, dry_run=True,
+        )
+        result = await _execute_tool("rewrite_commit_messages", {
+            "repo_path": "/tmp/repo", "use_ai": False,
+            "manual_mappings": {"old": "new"}, "dry_run": True,
+        })
+        assert result["success"] and result["dry_run"]
+
+    async def test_no_ai_no_mappings_rejected(self, patched_adapter: MagicMock) -> None:
+        result = await _execute_tool("rewrite_commit_messages", {
+            "repo_path": "/tmp/repo", "use_ai": False,
+        })
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+        assert "manual_mappings" in result["error"]
+
+    async def test_use_ai_with_manual_mappings_rejected(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        result = await _execute_tool("rewrite_commit_messages", {
+            "repo_path": "/tmp/repo", "use_ai": True,
+            "manual_mappings": {"a": "b"}, "dry_run": True,
+        })
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+        assert "manual_mappings" in result["error"]
+
+    async def test_manual_mappings_real_creates_backup(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        with patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.auto_backup = True
+            patched_adapter.create_backup.return_value = "backup_test"
+            patched_adapter.rewrite_commit_messages.return_value = make_fr(
+                commits_processed=3, commits_rewritten=1,
             )
-            MockAdapter.return_value = mock_adapter
+            result = await _execute_tool("rewrite_commit_messages", {
+                "repo_path": "/tmp/repo", "use_ai": False,
+                "manual_mappings": {"old": "new"}, "dry_run": False,
+            })
+        assert result["backup_branch"] == "backup_test"
+        patched_adapter.create_backup.assert_called_once()
 
-            result = await _execute_tool(
-                "change_commit_dates",
-                {
-                    "repo_path": "/tmp/repo",
-                    "time_range": "evening",
-                    "dry_run": True,
-                },
-            )
+    async def test_manual_mappings_dry_run_skips_backup(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        with patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.auto_backup = True
+            patched_adapter.rewrite_commit_messages.return_value = make_fr(dry_run=True)
+            result = await _execute_tool("rewrite_commit_messages", {
+                "repo_path": "/tmp/repo", "use_ai": False,
+                "manual_mappings": {"old": "new"}, "dry_run": True,
+            })
+        assert "backup_branch" not in result
+        patched_adapter.create_backup.assert_not_called()
 
-            assert result["success"] is True
-            assert result["dry_run"] is True
-            assert result["commits_rewritten"] == 5
+    async def test_invalid_style_rejected_by_pydantic(self) -> None:
+        result = await _execute_tool("rewrite_commit_messages", {
+            "repo_path": "/tmp/repo", "use_ai": True, "style": "nonexistent",
+        })
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
 
-    @pytest.mark.asyncio
-    async def test_weekend_only(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.change_commit_dates.return_value = FilterResult(
-                success=True,
-                message="Preview: weekend dates",
-                commits_processed=3,
-                commits_rewritten=3,
-                files_affected=[],
-                dry_run=True,
-                error=None,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "change_commit_dates",
-                {
-                    "repo_path": "/tmp/repo",
-                    "time_range": "random",
-                    "weekend_only": True,
-                    "dry_run": True,
-                },
-            )
-
-            assert result["success"] is True
-            mock_adapter.change_commit_dates.assert_called_once_with(
-                "random", True, True, None, dry_run=True, force=False,
-            )
-
-
-class TestMainExitCode:
-    """Test that main() propagates fatal errors correctly."""
-
-    def test_fatal_error_raises_system_exit(self):
-        with patch("git_filter_repo_mcp.server.asyncio.run", side_effect=RuntimeError("boom")):
-            with pytest.raises(SystemExit) as exc_info:
-                from git_filter_repo_mcp.server import main
-                main()
-            assert exc_info.value.code == 1
-
-    def test_keyboard_interrupt_exits_cleanly(self):
-        with patch("git_filter_repo_mcp.server.asyncio.run", side_effect=KeyboardInterrupt):
-            from git_filter_repo_mcp.server import main
-            # Should not raise SystemExit
-            main()
-
-
-class TestAIRewriteUsesBulkFiles:
-    """Test that AI rewrite mode uses collect_commit_files (bulk)."""
-
-    @pytest.mark.asyncio
-    async def test_ai_rewrite_calls_collect_commit_files(self):
-        from unittest.mock import AsyncMock
-
+    async def test_ai_rewrite_uses_bulk_collect_commit_files(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        """Regression: the AI flow must call ``collect_commit_files`` once,
+        not ``get_commit_files`` per commit."""
         mock_commits = [
-            CommitInfo("aaa111", "User", "u@e.com", "User", "u@e.com", "msg1", "2024-01-01"),
-            CommitInfo("bbb222", "User", "u@e.com", "User", "u@e.com", "msg2", "2024-01-02"),
+            make_ci("aaa111", "msg1"),
+            make_ci("bbb222", "msg2"),
         ]
+        patched_adapter.get_commits.return_value = mock_commits
+        patched_adapter.collect_commit_files.return_value = {
+            "aaa111": ["file1.py"], "bbb222": ["file2.py"],
+        }
 
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server._create_ai_provider") as mock_create, \
-             patch("git_filter_repo_mcp.server._check_ai_connection", new_callable=AsyncMock, return_value=None):
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = mock_commits
-            mock_adapter.collect_commit_files.return_value = {
-                "aaa111": ["file1.py"],
-                "bbb222": ["file2.py"],
-            }
-            MockAdapter.return_value = mock_adapter
+        mock_engine = MagicMock()
+        mock_engine.rewrite_batch = AsyncMock(return_value=[
+            MagicMock(original="msg1", rewritten="feat: msg1", commit_hash="aaa111"),
+            MagicMock(original="msg2", rewritten="feat: msg2", commit_hash="bbb222"),
+        ])
+        mock_engine.close = AsyncMock()
 
-            mock_provider = MagicMock()
-            mock_provider.generate_message = AsyncMock(side_effect=[
-                MagicMock(original="msg1", rewritten="feat: msg1", commit_hash="aaa111"),
-                MagicMock(original="msg2", rewritten="feat: msg2", commit_hash="bbb222"),
-            ])
-            mock_provider.close = AsyncMock()
+        with patch("git_filter_repo_mcp.server._create_ai_provider") as mock_create, \
+             patch("git_filter_repo_mcp.server._check_ai_connection",
+                   new_callable=AsyncMock, return_value=None), \
+             patch("git_filter_repo_mcp.server.AICommitEngine", return_value=mock_engine):
+            mock_create.return_value = MagicMock(close=AsyncMock())
+            await _execute_tool("rewrite_commit_messages", {
+                "repo_path": "/tmp/repo", "use_ai": True,
+                "ai_provider": "ollama", "dry_run": True,
+            })
 
-            mock_engine = MagicMock()
-            mock_engine.rewrite_message = AsyncMock(side_effect=[
-                MagicMock(original="msg1", rewritten="feat: msg1", commit_hash="aaa111"),
-                MagicMock(original="msg2", rewritten="feat: msg2", commit_hash="bbb222"),
-            ])
-            mock_engine.close = AsyncMock()
-
-            with patch("git_filter_repo_mcp.server.AICommitEngine", return_value=mock_engine):
-                mock_create.return_value = mock_provider
-
-                await _execute_tool(
-                    "rewrite_commit_messages",
-                    {
-                        "repo_path": "/tmp/repo",
-                        "use_ai": True,
-                        "ai_provider": "ollama",
-                        "dry_run": True,
-                    },
-                )
-
-                # Verify bulk method was called, NOT per-commit get_commit_files
-                mock_adapter.collect_commit_files.assert_called_once_with(
-                    mock_commits, "HEAD", 2,
-                )
-                mock_adapter.get_commit_files.assert_not_called()
+        patched_adapter.collect_commit_files.assert_called_once_with(
+            mock_commits, "HEAD", 2,
+        )
+        patched_adapter.get_commit_files.assert_not_called()
 
 
-class TestPartialAuthorValidation:
-    """Test that partial author info (only name or only email) is rejected."""
+# =========================================================================
+# rewrite_single_commit — combine all of its branches
+# =========================================================================
 
-    @pytest.mark.asyncio
-    async def test_only_name_rejected(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo("abc123", "User", "u@e.com", "User", "u@e.com", "msg", "2024-01-01"),
-            ]
-            mock_adapter._validate_commit_hash = MagicMock()
-            MockAdapter.return_value = mock_adapter
 
-            result = await _execute_tool(
-                "rewrite_single_commit",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "abc123",
-                    "new_author_name": "New Name",
-                    # new_author_email is missing
-                    "dry_run": False,
-                },
+class TestRewriteSingleCommit:
+    """``rewrite_single_commit`` has many branches; one class covers them all."""
+
+    @pytest.fixture
+    def adapter_with_commit(self, patched_adapter: MagicMock) -> MagicMock:
+        """Adapter pre-loaded with one commit, ready for happy-path tests."""
+        patched_adapter.get_commits.return_value = [make_ci("abc123def456", "Original message")]
+        patched_adapter._validate_commit_hash = MagicMock()
+        return patched_adapter
+
+    async def test_no_changes_returns_no_changes_error(
+        self, adapter_with_commit: MagicMock,
+    ) -> None:
+        result = await _execute_tool("rewrite_single_commit", {
+            "repo_path": "/tmp/repo", "commit_hash": "abc123", "dry_run": False,
+        })
+        assert result["success"] is False
+        assert "No changes specified" in result["error"]
+        assert result["error_code"] == ErrorCode.NO_CHANGES
+
+    async def test_dry_run_returns_preview(
+        self, adapter_with_commit: MagicMock,
+    ) -> None:
+        result = await _execute_tool("rewrite_single_commit", {
+            "repo_path": "/tmp/repo", "commit_hash": "abc123",
+            "new_message": "New message", "dry_run": True,
+        })
+        assert result["success"] and result["dry_run"]
+        assert result["new_message"] == "New message"
+
+    async def test_commit_not_found(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.get_commits.return_value = []
+        patched_adapter._validate_commit_hash = MagicMock()
+        result = await _execute_tool("rewrite_single_commit", {
+            "repo_path": "/tmp/repo", "commit_hash": "nonexistent",
+            "new_message": "New message",
+        })
+        assert result["success"] is False
+        assert "not found" in result["error"]
+
+    async def test_message_change_forwards_to_adapter(
+        self, adapter_with_commit: MagicMock,
+    ) -> None:
+        adapter_with_commit.rewrite_single_commit.return_value = make_fr(
+            message="Updated abc123de: message", commits_rewritten=1,
+        )
+        await _execute_tool("rewrite_single_commit", {
+            "repo_path": "/tmp/repo", "commit_hash": "abc123",
+            "new_message": "New message", "dry_run": False,
+        })
+        adapter_with_commit.rewrite_single_commit.assert_called_once_with(
+            "abc123",
+            new_message="New message",
+            new_author_name=None,
+            new_author_email=None,
+        )
+
+    @pytest.mark.parametrize(
+        "extra,missing_field",
+        [
+            ({"new_author_name": "New Name"}, "new_author_email"),
+            ({"new_author_email": "new@example.com"}, "new_author_name"),
+        ],
+        ids=["only_name", "only_email"],
+    )
+    async def test_partial_author_rejected(
+        self, adapter_with_commit: MagicMock,
+        extra: dict, missing_field: str,
+    ) -> None:
+        result = await _execute_tool("rewrite_single_commit", {
+            "repo_path": "/tmp/repo", "commit_hash": "abc123",
+            "dry_run": False, **extra,
+        })
+        assert result["success"] is False
+        assert missing_field in result["error"]
+
+    async def test_both_author_fields_accepted(
+        self, adapter_with_commit: MagicMock,
+    ) -> None:
+        adapter_with_commit.rewrite_single_commit.return_value = make_fr(
+            message="Updated abc123: author",
+        )
+        result = await _execute_tool("rewrite_single_commit", {
+            "repo_path": "/tmp/repo", "commit_hash": "abc123",
+            "new_author_name": "New Name", "new_author_email": "new@example.com",
+            "dry_run": False,
+        })
+        assert result["success"] is True
+
+    async def test_injection_hash_rejected_early(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        patched_adapter._validate_commit_hash.side_effect = ValueError("Invalid commit hash")
+        result = await _execute_tool("rewrite_single_commit", {
+            "repo_path": "/tmp/repo", "commit_hash": '"; evil code',
+            "new_message": "test", "dry_run": False,
+        })
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+
+
+# =========================================================================
+# Cross-cutting: auto-backup, AI provider plumbing, error envelopes, main()
+# =========================================================================
+
+
+class TestAutoBackup:
+    """Auto-backup must run before destructive ops, and never on dry_run."""
+
+    async def test_backup_runs_before_destructive_op(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        call_order: list[str] = []
+        with patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.auto_backup = True
+            patched_adapter.create_backup.side_effect = lambda: call_order.append("backup") or "backup_test"
+            patched_adapter.change_author.side_effect = (
+                lambda *a, **kw: call_order.append("change_author") or make_fr(message="done")
             )
-            assert result["success"] is False
-            assert "new_author_email" in result["error"]
+            await _execute_tool("change_author", {
+                "repo_path": "/tmp/repo", "old_email": "a@b",
+                "new_name": "N", "new_email": "n@b", "dry_run": False,
+            })
+        assert call_order == ["backup", "change_author"]
 
-    @pytest.mark.asyncio
-    async def test_only_email_rejected(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo("abc123", "User", "u@e.com", "User", "u@e.com", "msg", "2024-01-01"),
-            ]
-            mock_adapter._validate_commit_hash = MagicMock()
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_single_commit",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "abc123",
-                    "new_author_email": "new@example.com",
-                    # new_author_name is missing
-                    "dry_run": False,
-                },
-            )
-            assert result["success"] is False
-            assert "new_author_name" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_both_provided_accepted(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo("abc123", "User", "u@e.com", "User", "u@e.com", "msg", "2024-01-01"),
-            ]
-            mock_adapter._validate_commit_hash = MagicMock()
-            mock_adapter.rewrite_single_commit.return_value = FilterResult(
-                success=True, message="Updated abc123: author",
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_single_commit",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": "abc123",
-                    "new_author_name": "New Name",
-                    "new_author_email": "new@example.com",
-                    "dry_run": False,
-                },
-            )
-            assert result["success"] is True
+    async def test_dry_run_skips_backup(self, patched_adapter: MagicMock) -> None:
+        with patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.auto_backup = True
+            patched_adapter.change_author.return_value = make_fr(dry_run=True)
+            result = await _execute_tool("change_author", {
+                "repo_path": "/tmp/repo", "old_email": "a@b",
+                "new_name": "N", "new_email": "n@b", "dry_run": True,
+            })
+        assert "backup_branch" not in result
+        patched_adapter.create_backup.assert_not_called()
 
 
-class TestCommitHashValidationInHandler:
-    """Test that rewrite_single_commit handler validates commit hash early."""
+class TestAIProviderPlumbing:
+    """``_create_ai_provider`` reads config lazily and forwards correctly."""
 
-    @pytest.mark.asyncio
-    async def test_invalid_hash_rejected_early(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter._validate_commit_hash.side_effect = ValueError("Invalid commit hash")
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_single_commit",
-                {
-                    "repo_path": "/tmp/repo",
-                    "commit_hash": '"; evil code',
-                    "new_message": "test",
-                    "dry_run": False,
-                },
-            )
-            assert result["success"] is False
-            assert "INVALID_INPUT" in str(result.get("error_code", ""))
-
-
-class TestLazyConfig:
-    """Test that server uses get_config() lazily (not module-level snapshot)."""
-
-    @pytest.mark.asyncio
-    async def test_handler_reads_fresh_config(self):
-        """Verify _create_ai_provider calls get_config() each time."""
+    def test_create_ai_provider_reads_config(self) -> None:
         from git_filter_repo_mcp.server import _create_ai_provider
         with patch("git_filter_repo_mcp.server.get_config") as mock_gc, \
              patch("git_filter_repo_mcp.server.get_provider"):
@@ -972,42 +722,7 @@ class TestLazyConfig:
             _create_ai_provider({}, "ollama")
             mock_gc.assert_called()
 
-
-class TestAIProviderValidation:
-    """Test that invalid AI provider names are rejected early."""
-
-    @pytest.mark.asyncio
-    async def test_invalid_provider_rejected(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo("abc123", "User", "u@e.com", "User", "u@e.com", "msg", "2024-01-01"),
-            ]
-            mock_adapter.collect_commit_files.return_value = {"abc123": []}
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "rewrite_commit_messages",
-                {
-                    "repo_path": "/tmp/repo",
-                    "use_ai": True,
-                    "ai_provider": "nonexistent",
-                    "dry_run": True,
-                },
-            )
-            assert result["success"] is False
-            assert "Invalid AI provider" in result["error"] or "nonexistent" in result["error"]
-
-    def test_create_ai_provider_rejects_none(self):
-        from git_filter_repo_mcp.server import _create_ai_provider
-        with pytest.raises(ValueError, match="Invalid AI provider"):
-            _create_ai_provider({}, "none")
-
-
-class TestOpenAIBaseUrlForwarding:
-    """Test that openai_base_url config is forwarded to the provider."""
-
-    def test_openai_base_url_passed(self):
+    def test_openai_base_url_forwarded(self) -> None:
         from git_filter_repo_mcp.server import _create_ai_provider
         with patch("git_filter_repo_mcp.server.get_config") as mock_gc, \
              patch("git_filter_repo_mcp.server.get_provider") as mock_gp:
@@ -1016,321 +731,96 @@ class TestOpenAIBaseUrlForwarding:
             mock_gc.return_value.ai.openai_base_url = "https://custom.api.com/v1"
             _create_ai_provider({}, "openai")
             mock_gp.assert_called_once_with(
-                "openai",
-                model="gpt-4o",
-                api_key="sk-test",
+                "openai", model="gpt-4o", api_key="sk-test",
                 base_url="https://custom.api.com/v1",
             )
 
+    def test_rejects_none_provider(self) -> None:
+        from git_filter_repo_mcp.server import _create_ai_provider
+        with pytest.raises(ValueError, match="Invalid AI provider"):
+            _create_ai_provider({}, "none")
 
-class TestLoggingReconfigure:
-    """Test that logging can be reconfigured."""
-
-    def test_configure_logging_callable(self):
-        from git_filter_repo_mcp.server import _configure_logging
-        # Should not raise
-        _configure_logging()
-
-
-class TestToolsValidation:
-    """Test Pydantic validation constraints on tool inputs."""
-
-    def test_max_count_zero_rejected(self):
-        from git_filter_repo_mcp.tools import AnalyzeHistoryInput
-        with pytest.raises(Exception):
-            AnalyzeHistoryInput(repo_path="/tmp", max_count=0)
-
-    def test_max_count_negative_rejected(self):
-        from git_filter_repo_mcp.tools import AnalyzeHistoryInput
-        with pytest.raises(Exception):
-            AnalyzeHistoryInput(repo_path="/tmp", max_count=-1)
-
-    def test_max_count_over_limit_rejected(self):
-        from git_filter_repo_mcp.tools import AnalyzeHistoryInput
-        with pytest.raises(Exception):
-            AnalyzeHistoryInput(repo_path="/tmp", max_count=20000)
-
-    def test_size_threshold_zero_rejected(self):
-        from git_filter_repo_mcp.tools import RemoveLargeFilesInput
-        with pytest.raises(Exception):
-            RemoveLargeFilesInput(repo_path="/tmp", size_threshold_mb=0.0)
-
-    def test_size_threshold_negative_rejected(self):
-        from git_filter_repo_mcp.tools import RemoveLargeFilesInput
-        with pytest.raises(Exception):
-            RemoveLargeFilesInput(repo_path="/tmp", size_threshold_mb=-5.0)
-
-    def test_use_ai_defaults_false(self):
-        from git_filter_repo_mcp.tools import RewriteCommitMessagesInput
-        params = RewriteCommitMessagesInput(repo_path="/tmp")
-        assert params.use_ai is False
-
-    def test_ai_provider_defaults_none(self):
-        from git_filter_repo_mcp.tools import RewriteCommitMessagesInput
-        params = RewriteCommitMessagesInput(repo_path="/tmp")
-        assert params.ai_provider is None
-
-
-class TestGetCommitDetailsInjection:
-    """Test that get_commit_details rejects dash-prefixed hashes."""
-
-    @pytest.mark.asyncio
-    async def test_dash_hash_rejected(self):
-        result = await _execute_tool(
-            "get_commit_details",
-            {"repo_path": "/tmp/repo", "commit_hash": "--exec=evil"},
-        )
-        assert result["success"] is False
-        assert result["error_code"] == ErrorCode.INVALID_INPUT
-
-    @pytest.mark.asyncio
-    async def test_normal_hash_accepted(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo("abc123", "U", "u@e", "U", "u@e", "msg", "2024-01-01")
-            ]
-            mock_adapter.get_commit_files.return_value = []
-            mock_adapter.get_commit_diff.return_value = ""
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool(
-                "get_commit_details",
-                {"repo_path": "/tmp/repo", "commit_hash": "abc123"},
-            )
-            assert result["success"] is True
-
-
-class TestBackupBeforeDestructiveOps:
-    """Test that backup is created BEFORE destructive operations."""
-
-    @pytest.mark.asyncio
-    async def test_change_author_backup_before_operation(self):
-        """Verify create_backup is called before change_author."""
-        call_order = []
-
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server.get_config") as mock_config:
-            mock_config.return_value.server.auto_backup = True
-            mock_adapter = MagicMock()
-
-            def track_backup():
-                call_order.append("backup")
-                return "backup_test"
-            mock_adapter.create_backup.side_effect = track_backup
-
-            def track_change(*a, **kw):
-                call_order.append("change_author")
-                return FilterResult(success=True, message="done")
-            mock_adapter.change_author.side_effect = track_change
-            MockAdapter.return_value = mock_adapter
-
-            await _execute_tool("change_author", {
-                "repo_path": "/tmp/repo", "old_email": "a@b",
-                "new_name": "N", "new_email": "n@b", "dry_run": False,
-            })
-
-            assert call_order == ["backup", "change_author"]
-
-    @pytest.mark.asyncio
-    async def test_no_backup_on_dry_run(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server.get_config") as mock_config:
-            mock_config.return_value.server.auto_backup = True
-            mock_adapter = MagicMock()
-            mock_adapter.change_author.return_value = FilterResult(success=True, message="dry", dry_run=True)
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool("change_author", {
-                "repo_path": "/tmp/repo", "old_email": "a@b",
-                "new_name": "N", "new_email": "n@b", "dry_run": True,
-            })
-
-            mock_adapter.create_backup.assert_not_called()
-            assert "backup_branch" not in result
-
-
-class TestTimeoutHandling:
-    """Test that subprocess timeouts return structured errors, not crashes."""
-
-    @pytest.mark.asyncio
-    async def test_timeout_returns_error(self):
-        import subprocess as sp
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            MockAdapter.side_effect = sp.TimeoutExpired("git", 30)
-
-            result = await _execute_tool("analyze_git_history", {"repo_path": "/tmp/repo"})
-            assert result["success"] is False
-            assert "timed out" in result["error"]
-            assert result["error_code"] == ErrorCode.COMMAND_FAILED
-
-
-class TestSquashInjection:
-    """Test that squash_commits rejects dash-prefixed refs."""
-
-    @pytest.mark.asyncio
-    async def test_dash_start_commit_rejected(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.squash_commits.side_effect = ValueError("Invalid ref")
-            MockAdapter.return_value = mock_adapter
-            result = await _execute_tool("squash_commits", {
-                "repo_path": "/tmp/repo", "start_commit": "--exec=evil", "dry_run": True,
-            })
-            assert result["success"] is False
-
-
-class TestReplaceTextValidation:
-    """Test replace_text input validation."""
-
-    @pytest.mark.asyncio
-    async def test_empty_old_text_rejected(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.replace_text_in_history.return_value = FilterResult(
-                success=False, message="old_text must not be empty",
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool("replace_text_in_history", {
-                "repo_path": "/tmp/repo", "old_text": "", "new_text": "x", "dry_run": True,
-            })
-            assert result["success"] is False
-
-
-class TestManualMappingsRealExecution:
-    """Test rewrite_commit_messages with manual_mappings, dry_run=False."""
-
-    @pytest.mark.asyncio
-    async def test_manual_mappings_real_calls_adapter(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server.get_config") as mock_config:
-            mock_config.return_value.server.auto_backup = True
-            mock_adapter = MagicMock()
-            mock_adapter.create_backup.return_value = "backup_test"
-            mock_adapter.rewrite_commit_messages.return_value = FilterResult(
-                success=True, message="Rewrote 1", commits_processed=3, commits_rewritten=1,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool("rewrite_commit_messages", {
-                "repo_path": "/tmp/repo", "use_ai": False,
-                "manual_mappings": {"old": "new"}, "dry_run": False,
-            })
-
-            assert result["success"] is True
-            assert result["backup_branch"] == "backup_test"
-            mock_adapter.rewrite_commit_messages.assert_called_once()
-            mock_adapter.create_backup.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_manual_mappings_no_backup_on_dry_run(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server.get_config") as mock_config:
-            mock_config.return_value.server.auto_backup = True
-            mock_adapter = MagicMock()
-            mock_adapter.rewrite_commit_messages.return_value = FilterResult(
-                success=True, message="Dry run", dry_run=True,
-            )
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool("rewrite_commit_messages", {
-                "repo_path": "/tmp/repo", "use_ai": False,
-                "manual_mappings": {"old": "new"}, "dry_run": True,
-            })
-
-            assert result["success"] is True
-            assert "backup_branch" not in result
-            mock_adapter.create_backup.assert_not_called()
-
-
-class TestScanSecretsEmptyRepo:
-    """Test scan_secrets on various repo states."""
-
-    @pytest.mark.asyncio
-    async def test_empty_repo_scan(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            mock_adapter = MagicMock()
-            mock_adapter.scan_secrets.return_value = {
-                "commits_scanned": 0, "secrets_found": 0,
-                "sensitive_files": 0, "findings": [],
-                "sensitive_file_list": [], "files_scanned": 0,
-            }
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool("scan_secrets", {"repo_path": "/tmp/repo"})
-            assert result["success"] is True
-            assert result["secrets_found"] == 0
-
-
-class TestStyleValidation:
-    """Test that invalid message styles are rejected by Pydantic."""
-
-    @pytest.mark.asyncio
-    async def test_invalid_style_rejected(self):
+    async def test_invalid_provider_at_pydantic_layer(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        patched_adapter.get_commits.return_value = [make_ci("abc123")]
+        patched_adapter.collect_commit_files.return_value = {"abc123": []}
         result = await _execute_tool("rewrite_commit_messages", {
-            "repo_path": "/tmp/repo", "use_ai": True, "style": "nonexistent",
+            "repo_path": "/tmp/repo", "use_ai": True,
+            "ai_provider": "nonexistent", "dry_run": True,
         })
         assert result["success"] is False
-        assert result["error_code"] == ErrorCode.INVALID_INPUT
+        # Could match either pydantic's Literal message or the legacy check.
+        assert (
+            "Invalid AI provider" in result["error"]
+            or "nonexistent" in result["error"]
+            or "ai_provider" in result["error"]
+        )
 
-    @pytest.mark.asyncio
-    async def test_valid_styles_accepted(self):
-        """All four valid styles should pass Pydantic validation."""
-        from git_filter_repo_mcp.tools import RewriteCommitMessagesInput
-        for style in ("conventional", "gitmoji", "simple", "detailed"):
-            params = RewriteCommitMessagesInput(repo_path="/tmp", style=style)
-            assert params.style == style
-
-
-class TestAIProviderNoneRejection:
-    """Test that use_ai=True with provider='none' gives clear error."""
-
-    @pytest.mark.asyncio
-    async def test_rewrite_messages_none_provider_rejected(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server.get_config") as mock_config:
+    @pytest.mark.parametrize(
+        "tool,extra_args",
+        [
+            ("rewrite_commit_messages", {"dry_run": True}),
+            ("rewrite_single_commit",
+             {"commit_hash": "abc123", "dry_run": False}),
+        ],
+    )
+    async def test_provider_none_in_config_rejected(
+        self, patched_adapter: MagicMock, tool: str, extra_args: dict,
+    ) -> None:
+        patched_adapter.get_commits.return_value = [make_ci("abc123")]
+        patched_adapter._validate_commit_hash = MagicMock()
+        with patch("git_filter_repo_mcp.server.get_config") as mock_config:
             mock_config.return_value.ai.provider = "none"
-            MockAdapter.return_value = MagicMock()
-
-            result = await _execute_tool("rewrite_commit_messages", {
-                "repo_path": "/tmp/repo", "use_ai": True, "dry_run": True,
+            result = await _execute_tool(tool, {
+                "repo_path": "/tmp/repo", "use_ai": True, **extra_args,
             })
-            assert result["success"] is False
-            assert "none" in result["error"].lower()
-            assert result["error_code"] == ErrorCode.INVALID_INPUT
-
-    @pytest.mark.asyncio
-    async def test_rewrite_single_none_provider_rejected(self):
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter, \
-             patch("git_filter_repo_mcp.server.get_config") as mock_config:
-            mock_config.return_value.ai.provider = "none"
-            mock_adapter = MagicMock()
-            mock_adapter.get_commits.return_value = [
-                CommitInfo("abc123", "U", "u@e", "U", "u@e", "msg", "2024-01-01")
-            ]
-            mock_adapter._validate_commit_hash = MagicMock()
-            MockAdapter.return_value = mock_adapter
-
-            result = await _execute_tool("rewrite_single_commit", {
-                "repo_path": "/tmp/repo", "commit_hash": "abc123",
-                "use_ai": True, "dry_run": False,
-            })
-            assert result["success"] is False
-            assert "none" in result["error"].lower()
+        assert result["success"] is False
+        assert "none" in result["error"].lower()
 
 
-class TestCalledProcessErrorHandling:
-    """Test that CalledProcessError returns structured error, not 'Internal error'."""
+class TestErrorEnvelope:
+    """Adapter/subprocess errors must become structured handler responses."""
 
-    @pytest.mark.asyncio
-    async def test_called_process_error_structured(self):
-        import subprocess as sp
-        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter") as MockAdapter:
-            MockAdapter.side_effect = sp.CalledProcessError(128, ["git", "log"], stderr="fatal: bad ref")
-
+    async def test_timeout(self) -> None:
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter",
+                   side_effect=sp.TimeoutExpired("git", 30)):
             result = await _execute_tool("analyze_git_history", {"repo_path": "/tmp/repo"})
-            assert result["success"] is False
-            assert result["error_code"] == ErrorCode.COMMAND_FAILED
-            assert "Command failed" in result["error"]
-            assert "Internal error" not in result["error"]
+        assert result["success"] is False
+        assert "timed out" in result["error"]
+        assert result["error_code"] == ErrorCode.COMMAND_FAILED
+
+    async def test_called_process_error(self) -> None:
+        with patch("git_filter_repo_mcp.server.GitFilterRepoAdapter",
+                   side_effect=sp.CalledProcessError(128, ["git", "log"], stderr="fatal")):
+            result = await _execute_tool("analyze_git_history", {"repo_path": "/tmp/repo"})
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.COMMAND_FAILED
+        assert "Command failed" in result["error"]
+        assert "Internal error" not in result["error"]
+
+
+class TestServerLifecycle:
+    """``main()`` and logging helpers."""
+
+    def test_main_keyboard_interrupt_exits_cleanly(self) -> None:
+        with patch(
+            "git_filter_repo_mcp.server.asyncio.run",
+            side_effect=KeyboardInterrupt,
+        ):
+            from git_filter_repo_mcp.server import main
+            main()  # must not raise SystemExit
+
+    def test_main_fatal_error_propagates(self) -> None:
+        with patch(
+            "git_filter_repo_mcp.server.asyncio.run",
+            side_effect=RuntimeError("boom"),
+        ):
+            from git_filter_repo_mcp.server import main
+            with pytest.raises(SystemExit) as excinfo:
+                main()
+        assert excinfo.value.code == 1
+
+    def test_configure_logging_callable(self) -> None:
+        from git_filter_repo_mcp.server import _configure_logging
+        _configure_logging()  # must not raise

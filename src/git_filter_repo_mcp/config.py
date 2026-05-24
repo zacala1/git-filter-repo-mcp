@@ -48,20 +48,25 @@ class Config:
 
 def load_config() -> Config:
     """
-    Load configuration from multiple sources (in priority order):
+    Load configuration from multiple sources (in priority order, highest first):
     1. Environment variables (highest priority)
-    2. Config file (~/.config/git-filter-repo-mcp/config.json)
-    3. Local config file (./config.json)
+    2. Local config file (./config.json) — project-level override
+    3. User config file (~/.config/git-filter-repo-mcp/config.json)
     4. Default values (lowest priority)
+
+    This mirrors typical conventions (e.g. git, npm) where project-local
+    settings override the user-global ones.
     """
     config = Config()
 
+    # Listed lowest-priority first so the loop below applies them in order
+    # and later entries override earlier ones.
     config_paths = [
-        Path("./config.json"),
         Path.home() / ".config" / "git-filter-repo-mcp" / "config.json",
+        Path("./config.json"),
     ]
 
-    for config_path in reversed(config_paths):  # Lower priority first
+    for config_path in config_paths:
         if config_path.exists():
             try:
                 with open(config_path) as f:

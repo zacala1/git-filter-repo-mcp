@@ -18,131 +18,142 @@ class ErrorCode(str, Enum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
-class AnalyzeHistoryInput(BaseModel):
-    """Input for analyze_history tool."""
+# --- Base models ---
+#
+# Every tool input carries ``repo_path``; destructive tools additionally carry
+# ``dry_run``. Centralising these avoids drift in description text and lets us
+# add cross-cutting validation in one place.
+
+
+class _RepoInput(BaseModel):
+    """Base for any tool that targets a git repository."""
 
     repo_path: str = Field(description="Path to the git repository")
+
+
+class _DestructiveRepoInput(_RepoInput):
+    """Base for tools that mutate history (must support ``dry_run``)."""
+
+    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
+
+
+_AIProviderField = Field(
+    default=None,
+    description="AI provider: ollama, openai, or anthropic (uses config default if not set)",
+)
+_AIModelField = Field(
+    default=None, description="AI model to use (uses config default if not set)",
+)
+AIProvider = Literal["ollama", "openai", "anthropic"]
+
+
+# --- Tool inputs ---
+
+
+class AnalyzeHistoryInput(_RepoInput):
+    """Input for analyze_history tool."""
+
     branch: str = Field(default="HEAD", description="Branch to analyze")
     max_count: int = Field(default=100, gt=0, le=10000, description="Maximum number of commits to analyze")
 
 
-class RewriteCommitMessagesInput(BaseModel):
+class RewriteCommitMessagesInput(_DestructiveRepoInput):
     """Input for rewrite_commit_messages tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     branch: str = Field(default="HEAD", description="Branch to rewrite")
     style: Literal["conventional", "gitmoji", "simple", "detailed"] = Field(
         default="conventional",
         description="Message style: conventional, gitmoji, simple, or detailed",
     )
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
     use_ai: bool = Field(default=False, description="Use AI to generate new messages")
-    ai_provider: str | None = Field(default=None, description="AI provider: ollama, openai, or anthropic (uses config default if not set)")
-    ai_model: str | None = Field(default=None, description="AI model to use (uses config default if not set)")
+    ai_provider: AIProvider | None = _AIProviderField
+    ai_model: str | None = _AIModelField
     manual_mappings: dict[str, str] | None = Field(
         default=None, description="Manual message mappings: {old_message: new_message}"
     )
 
 
-class ChangeAuthorInput(BaseModel):
+class ChangeAuthorInput(_DestructiveRepoInput):
     """Input for change_author tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     old_email: str = Field(description="Email address to replace")
     new_name: str = Field(description="New author name")
     new_email: str = Field(description="New author email")
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
-class RemoveFilesInput(BaseModel):
+class RemoveFilesInput(_DestructiveRepoInput):
     """Input for remove_files tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     paths: list[str] = Field(description="List of file paths to remove from history")
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
-class RemoveLargeFilesInput(BaseModel):
+class RemoveLargeFilesInput(_DestructiveRepoInput):
     """Input for remove_large_files tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     size_threshold_mb: float = Field(
         default=10.0, gt=0.0, description="Size threshold in MB - files larger than this will be removed"
     )
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
-class FilterPathsInput(BaseModel):
+class FilterPathsInput(_DestructiveRepoInput):
     """Input for filter_paths tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     include_paths: list[str] | None = Field(
         default=None, description="Paths to include (keep only these)"
     )
     exclude_paths: list[str] | None = Field(
         default=None, description="Paths to exclude (remove these)"
     )
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
-class CreateBackupInput(BaseModel):
+class CreateBackupInput(_RepoInput):
     """Input for create_backup tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
 
-
-class RestoreBackupInput(BaseModel):
+class RestoreBackupInput(_RepoInput):
     """Input for restore_backup tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     backup_branch: str = Field(description="Name of the backup branch to restore")
 
 
-class GetCommitDetailsInput(BaseModel):
+class GetCommitDetailsInput(_RepoInput):
     """Input for get_commit_details tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     commit_hash: str = Field(description="Commit hash to get details for")
 
 
-class RewriteSingleCommitInput(BaseModel):
+class RewriteSingleCommitInput(_DestructiveRepoInput):
     """Input for rewrite_single_commit tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     commit_hash: str = Field(description="Commit hash to rewrite")
     new_message: str | None = Field(default=None, description="New commit message")
     new_author_name: str | None = Field(default=None, description="New author name")
     new_author_email: str | None = Field(default=None, description="New author email")
     use_ai: bool = Field(default=False, description="Use AI to generate message if not provided")
-    ai_provider: str | None = Field(default=None, description="AI provider: ollama, openai, or anthropic (uses config default if not set)")
-    ai_model: str | None = Field(default=None, description="AI model to use (uses config default if not set)")
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
+    ai_provider: AIProvider | None = _AIProviderField
+    ai_model: str | None = _AIModelField
 
 
-class ScanSecretsInput(BaseModel):
+class ScanSecretsInput(_RepoInput):
     """Input for scan_secrets tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     branch: str = Field(default="HEAD", description="Branch to scan")
     max_commits: int = Field(default=100, gt=0, le=10000, description="Maximum number of commits to scan")
 
 
-class SquashCommitsInput(BaseModel):
+class SquashCommitsInput(_DestructiveRepoInput):
     """Input for squash_commits tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     start_commit: str = Field(description="Starting commit hash (exclusive)")
     end_commit: str = Field(default="HEAD", description="Ending commit hash (inclusive)")
     new_message: str | None = Field(
         default=None, description="New commit message for squashed commit"
     )
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
-class ChangeCommitDatesInput(BaseModel):
+class ChangeCommitDatesInput(_DestructiveRepoInput):
     """Input for change_commit_dates tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     time_range: str = Field(
         default="evening",
         description="Time range preset: 'evening' (19:00-23:00), 'night' (22:00-02:00), "
@@ -158,29 +169,25 @@ class ChangeCommitDatesInput(BaseModel):
         default=None,
         description="Start date for the new commit range (YYYY-MM-DD). Defaults to original earliest commit date.",
     )
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
-class ReplaceTextInput(BaseModel):
+class ReplaceTextInput(_DestructiveRepoInput):
     """Input for replace_text_in_history tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     old_text: str = Field(description="Text to find and replace")
     new_text: str = Field(description="Replacement text")
     file_pattern: str | None = Field(
         default=None, description="Glob pattern to filter files (e.g., '*.py')"
     )
-    dry_run: bool = Field(default=True, description="If true, only show what would be changed")
 
 
-class GetFileHistoryInput(BaseModel):
+class GetFileHistoryInput(_RepoInput):
     """Input for get_file_history tool."""
 
-    repo_path: str = Field(description="Path to the git repository")
     file_path: str = Field(description="Path to the file")
 
 
-class ListAllFilesInput(BaseModel):
+class ListAllFilesInput(_RepoInput):
     """Input for list_all_files_in_history tool."""
 
     repo_path: str = Field(description="Path to the git repository")

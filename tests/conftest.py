@@ -1,4 +1,11 @@
-"""Shared test fixtures."""
+"""Shared test fixtures and collection hooks.
+
+Test organisation conventions:
+- Pure-Python unit tests sit at module level with no real-git fixtures.
+- Integration tests use ``temp_git_repo`` (or its siblings) and are
+  automatically tagged ``integration`` by ``pytest_collection_modifyitems``
+  below so CI can run only the fast unit slice with ``-m "not integration"``.
+"""
 
 import os
 import subprocess
@@ -15,6 +22,29 @@ requires_git_filter_repo = pytest.mark.skipif(
     ),
     reason="git-filter-repo not installed",
 )
+
+
+# Fixture names that spin up a real git repo — any test using these is
+# integration by definition. Listing them here keeps the marker logic in
+# one place; add new repo fixtures here when defined.
+_REPO_FIXTURES = frozenset({
+    "temp_git_repo",
+    "empty_git_repo",
+    "single_commit_repo",
+    "unicode_git_repo",
+    "multiline_commit_repo",
+})
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-tag tests touching real git repos as ``integration``.
+
+    Lets ``pytest -m "not integration"`` produce a quick unit-only run.
+    """
+    integration = pytest.mark.integration
+    for item in items:
+        if _REPO_FIXTURES & set(getattr(item, "fixturenames", ())):
+            item.add_marker(integration)
 
 
 def _init_repo(repo_path: Path) -> None:
@@ -57,6 +87,24 @@ def temp_git_repo():
         _commit(repo_path, "Add config")
 
         yield repo_path
+
+
+@pytest.fixture
+def adapter(temp_git_repo):
+    """A ``GitFilterRepoAdapter`` bound to the 3-commit ``temp_git_repo``.
+
+    Most integration tests want this — having it as a fixture removes the
+    ``GitFilterRepoAdapter(str(temp_git_repo))`` line from every test body
+    and centralises the repo lifecycle.
+    """
+    from git_filter_repo_mcp.adapter import GitFilterRepoAdapter
+    return GitFilterRepoAdapter(str(temp_git_repo))
+
+
+def add_commit(repo_path: Path, filename: str, content: str, message: str) -> None:
+    """Convenience for tests that need an extra commit on top of a fixture."""
+    (repo_path / filename).write_text(content)
+    _commit(repo_path, message)
 
 
 @pytest.fixture

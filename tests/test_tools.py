@@ -1,96 +1,96 @@
-"""Tests for MCP tool definitions."""
+"""Unit tests for MCP tool definitions and the ErrorCode enum."""
+
+import json
+
+import pytest
 
 from git_filter_repo_mcp.tools import TOOL_DEFINITIONS, ErrorCode
 
 
+# Canonical list of tool names the server must expose. Adding/removing a
+# tool requires updating this set, which forces a deliberate review.
+EXPECTED_TOOLS: frozenset[str] = frozenset({
+    "analyze_git_history",
+    "rewrite_commit_messages",
+    "change_author",
+    "remove_files_from_history",
+    "remove_large_files",
+    "filter_paths",
+    "create_backup",
+    "restore_backup",
+    "get_commit_details",
+    "rewrite_single_commit",
+    "scan_secrets",
+    "squash_commits",
+    "replace_text_in_history",
+    "get_file_history",
+    "list_all_files_in_history",
+    "change_commit_dates",
+})
+
+# Tools that mutate history and therefore MUST expose ``dry_run``.
+DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
+    "rewrite_commit_messages",
+    "change_author",
+    "remove_files_from_history",
+    "remove_large_files",
+    "filter_paths",
+    "squash_commits",
+    "replace_text_in_history",
+    "rewrite_single_commit",
+    "change_commit_dates",
+})
+
+
 class TestToolDefinitions:
-    """Test tool definitions."""
+    """Structural invariants of ``TOOL_DEFINITIONS``."""
 
-    def test_tool_count(self):
-        # We should have 16 tools
-        assert len(TOOL_DEFINITIONS) >= 16
+    def test_exposes_exact_expected_set(self) -> None:
+        names = {tool["name"] for tool in TOOL_DEFINITIONS}
+        assert names == EXPECTED_TOOLS, (
+            f"missing={EXPECTED_TOOLS - names}, extra={names - EXPECTED_TOOLS}"
+        )
 
-    def test_all_tools_have_required_fields(self):
-        for tool in TOOL_DEFINITIONS:
-            assert "name" in tool, f"Tool missing 'name': {tool}"
-            assert "description" in tool, f"Tool {tool.get('name')} missing 'description'"
-            assert "inputSchema" in tool, f"Tool {tool.get('name')} missing 'inputSchema'"
-
-    def test_tool_names_are_unique(self):
+    def test_names_are_unique(self) -> None:
         names = [tool["name"] for tool in TOOL_DEFINITIONS]
-        assert len(names) == len(set(names)), "Duplicate tool names found"
+        assert len(names) == len(set(names))
 
-    def test_expected_tools_exist(self):
-        tool_names = {tool["name"] for tool in TOOL_DEFINITIONS}
-        expected_tools = {
-            "analyze_git_history",
-            "rewrite_commit_messages",
-            "change_author",
-            "remove_files_from_history",
-            "remove_large_files",
-            "filter_paths",
-            "create_backup",
-            "restore_backup",
-            "get_commit_details",
-            "rewrite_single_commit",
-            "scan_secrets",
-            "squash_commits",
-            "replace_text_in_history",
-            "get_file_history",
-            "list_all_files_in_history",
-            "change_commit_dates",
-        }
-        for expected in expected_tools:
-            assert expected in tool_names, f"Missing expected tool: {expected}"
+    @pytest.mark.parametrize("tool", TOOL_DEFINITIONS, ids=lambda t: t["name"])
+    def test_required_top_level_fields(self, tool: dict) -> None:
+        assert {"name", "description", "inputSchema"} <= tool.keys()
+        assert isinstance(tool["description"], str) and tool["description"].strip()
 
-    def test_input_schemas_are_valid(self):
-        for tool in TOOL_DEFINITIONS:
-            schema = tool["inputSchema"]
-            assert isinstance(schema, dict), f"Invalid schema for {tool['name']}"
-            # JSON Schema should have 'type' or 'properties'
-            assert "type" in schema or "properties" in schema, (
-                f"Schema for {tool['name']} missing type/properties"
-            )
+    @pytest.mark.parametrize("tool", TOOL_DEFINITIONS, ids=lambda t: t["name"])
+    def test_input_schema_shape(self, tool: dict) -> None:
+        schema = tool["inputSchema"]
+        assert isinstance(schema, dict)
+        assert "type" in schema or "properties" in schema
 
-    def test_dangerous_tools_have_dry_run(self):
-        """Tools that modify history should have dry_run parameter."""
-        dangerous_tools = [
-            "rewrite_commit_messages",
-            "change_author",
-            "remove_files_from_history",
-            "remove_large_files",
-            "filter_paths",
-            "squash_commits",
-            "replace_text_in_history",
-            "rewrite_single_commit",
-            "change_commit_dates",
-        ]
-        for tool in TOOL_DEFINITIONS:
-            if tool["name"] in dangerous_tools:
-                schema = tool["inputSchema"]
-                properties = schema.get("properties", {})
-                assert "dry_run" in properties, (
-                    f"Dangerous tool {tool['name']} missing dry_run parameter"
-                )
+    @pytest.mark.parametrize(
+        "tool",
+        [t for t in TOOL_DEFINITIONS if t["name"] in DESTRUCTIVE_TOOLS],
+        ids=lambda t: t["name"],
+    )
+    def test_destructive_tool_has_dry_run(self, tool: dict) -> None:
+        properties = tool["inputSchema"].get("properties", {})
+        assert "dry_run" in properties, (
+            f"{tool['name']} is destructive but missing dry_run"
+        )
 
 
 class TestErrorCode:
-    """Test ErrorCode enum."""
+    """``ErrorCode`` string enum used in tool responses."""
 
-    def test_all_codes_defined(self):
-        expected = {
+    def test_full_set_defined(self) -> None:
+        assert {code.value for code in ErrorCode} == {
             "INVALID_INPUT", "REPO_NOT_FOUND", "TOOL_NOT_FOUND",
             "COMMAND_FAILED", "AI_CONNECTION_FAILED", "NO_CHANGES", "INTERNAL_ERROR",
         }
-        actual = {code.value for code in ErrorCode}
-        assert actual == expected
 
-    def test_string_enum(self):
+    def test_is_str_enum(self) -> None:
         assert isinstance(ErrorCode.INVALID_INPUT, str)
         assert ErrorCode.INVALID_INPUT == "INVALID_INPUT"
 
-    def test_serializable_in_json(self):
-        import json
-        data = {"error_code": ErrorCode.REPO_NOT_FOUND}
-        serialized = json.dumps(data)
-        assert '"REPO_NOT_FOUND"' in serialized
+    def test_json_serialisable(self) -> None:
+        serialised = json.dumps({"error_code": ErrorCode.REPO_NOT_FOUND})
+        assert '"REPO_NOT_FOUND"' in serialised

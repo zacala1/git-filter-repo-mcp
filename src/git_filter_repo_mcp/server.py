@@ -108,6 +108,27 @@ def _maybe_backup(adapter: GitFilterRepoAdapter, dry_run: bool) -> str | None:
     return None
 
 
+def _run_destructive(
+    repo_path: str,
+    dry_run: bool,
+    action: Callable[[GitFilterRepoAdapter], FilterResult],
+) -> dict:
+    """Common pipeline for destructive tools: create adapter, optionally back
+    up, run the action, and surface the backup branch on the response.
+
+    The action receives the constructed adapter and returns a ``FilterResult``.
+    Centralising this collapses ~6 lines of identical boilerplate across every
+    destructive handler.
+    """
+    adapter = GitFilterRepoAdapter(repo_path)
+    backup = _maybe_backup(adapter, dry_run)
+    result = action(adapter)
+    response = result_to_dict(result)
+    if backup:
+        response["backup_branch"] = backup
+    return response
+
+
 _VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic"}
 
 
@@ -163,6 +184,17 @@ async def _handle_analyze(args: dict) -> dict:
 async def _handle_rewrite_messages(args: dict) -> dict:
     params = RewriteCommitMessagesInput(**args)
     dry_run = params.dry_run
+
+    # Reject ambiguous input early — silently ignoring manual_mappings while
+    # using AI would surprise users debugging unexpected rewrites.
+    if params.use_ai and params.manual_mappings:
+        return {
+            "success": False,
+            "error": "Cannot use use_ai=true together with manual_mappings. "
+                     "Provide one or the other.",
+            "error_code": ErrorCode.INVALID_INPUT,
+        }
+
     adapter = await asyncio.to_thread(GitFilterRepoAdapter, params.repo_path)
 
     if params.use_ai:
@@ -255,65 +287,49 @@ async def _handle_rewrite_messages(args: dict) -> dict:
 @tool_handler("change_author")
 async def _handle_change_author(args: dict) -> dict:
     params = ChangeAuthorInput(**args)
-
-    def _run():
-        adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = _maybe_backup(adapter, params.dry_run)
-        result = adapter.change_author(params.old_email, params.new_name, params.new_email, params.dry_run, not params.dry_run)
-        response = result_to_dict(result)
-        if backup:
-            response["backup_branch"] = backup
-        return response
-
-    return await asyncio.to_thread(_run)
+    return await asyncio.to_thread(
+        _run_destructive,
+        params.repo_path, params.dry_run,
+        lambda a: a.change_author(
+            params.old_email, params.new_name, params.new_email,
+            params.dry_run, not params.dry_run,
+        ),
+    )
 
 
 @tool_handler("remove_files_from_history")
 async def _handle_remove_files(args: dict) -> dict:
     params = RemoveFilesInput(**args)
-
-    def _run():
-        adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = _maybe_backup(adapter, params.dry_run)
-        result = adapter.remove_files(params.paths, params.dry_run, not params.dry_run)
-        response = result_to_dict(result)
-        if backup:
-            response["backup_branch"] = backup
-        return response
-
-    return await asyncio.to_thread(_run)
+    return await asyncio.to_thread(
+        _run_destructive,
+        params.repo_path, params.dry_run,
+        lambda a: a.remove_files(params.paths, params.dry_run, not params.dry_run),
+    )
 
 
 @tool_handler("remove_large_files")
 async def _handle_remove_large_files(args: dict) -> dict:
     params = RemoveLargeFilesInput(**args)
-
-    def _run():
-        adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = _maybe_backup(adapter, params.dry_run)
-        result = adapter.remove_large_files(params.size_threshold_mb, params.dry_run, not params.dry_run)
-        response = result_to_dict(result)
-        if backup:
-            response["backup_branch"] = backup
-        return response
-
-    return await asyncio.to_thread(_run)
+    return await asyncio.to_thread(
+        _run_destructive,
+        params.repo_path, params.dry_run,
+        lambda a: a.remove_large_files(
+            params.size_threshold_mb, params.dry_run, not params.dry_run,
+        ),
+    )
 
 
 @tool_handler("filter_paths")
 async def _handle_filter_paths(args: dict) -> dict:
     params = FilterPathsInput(**args)
-
-    def _run():
-        adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = _maybe_backup(adapter, params.dry_run)
-        result = adapter.filter_paths(params.include_paths, params.exclude_paths, params.dry_run, not params.dry_run)
-        response = result_to_dict(result)
-        if backup:
-            response["backup_branch"] = backup
-        return response
-
-    return await asyncio.to_thread(_run)
+    return await asyncio.to_thread(
+        _run_destructive,
+        params.repo_path, params.dry_run,
+        lambda a: a.filter_paths(
+            params.include_paths, params.exclude_paths,
+            params.dry_run, not params.dry_run,
+        ),
+    )
 
 
 @tool_handler("create_backup")
@@ -457,35 +473,26 @@ async def _handle_scan_secrets(args: dict) -> dict:
 @tool_handler("squash_commits")
 async def _handle_squash_commits(args: dict) -> dict:
     params = SquashCommitsInput(**args)
-
-    def _run():
-        adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = _maybe_backup(adapter, params.dry_run)
-        result = adapter.squash_commits(params.start_commit, params.end_commit, params.new_message, params.dry_run)
-        response = result_to_dict(result)
-        if backup:
-            response["backup_branch"] = backup
-        return response
-
-    return await asyncio.to_thread(_run)
+    return await asyncio.to_thread(
+        _run_destructive,
+        params.repo_path, params.dry_run,
+        lambda a: a.squash_commits(
+            params.start_commit, params.end_commit, params.new_message, params.dry_run,
+        ),
+    )
 
 
 @tool_handler("replace_text_in_history")
 async def _handle_replace_text(args: dict) -> dict:
     params = ReplaceTextInput(**args)
-
-    def _run():
-        adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = _maybe_backup(adapter, params.dry_run)
-        result = adapter.replace_text_in_history(
-            params.old_text, params.new_text, params.file_pattern, params.dry_run, not params.dry_run,
-        )
-        response = result_to_dict(result)
-        if backup:
-            response["backup_branch"] = backup
-        return response
-
-    return await asyncio.to_thread(_run)
+    return await asyncio.to_thread(
+        _run_destructive,
+        params.repo_path, params.dry_run,
+        lambda a: a.replace_text_in_history(
+            params.old_text, params.new_text, params.file_pattern,
+            params.dry_run, not params.dry_run,
+        ),
+    )
 
 
 @tool_handler("get_file_history")
@@ -513,20 +520,14 @@ async def _handle_list_all_files(args: dict) -> dict:
 @tool_handler("change_commit_dates")
 async def _handle_change_dates(args: dict) -> dict:
     params = ChangeCommitDatesInput(**args)
-
-    def _run():
-        adapter = GitFilterRepoAdapter(params.repo_path)
-        backup = _maybe_backup(adapter, params.dry_run)
-        result = adapter.change_commit_dates(
+    return await asyncio.to_thread(
+        _run_destructive,
+        params.repo_path, params.dry_run,
+        lambda a: a.change_commit_dates(
             params.time_range, params.weekend_only, params.preserve_order,
             params.start_date, dry_run=params.dry_run, force=not params.dry_run,
-        )
-        response = result_to_dict(result)
-        if backup:
-            response["backup_branch"] = backup
-        return response
-
-    return await asyncio.to_thread(_run)
+        ),
+    )
 
 
 # --- MCP Protocol ---
