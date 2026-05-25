@@ -40,13 +40,16 @@ logger = logging.getLogger(__name__)
 
 
 def _configure_logging() -> None:
-    """Configure logging level from config. Safe to call multiple times."""
+    """Configure logging level from config.
+
+    Idempotent. NOT called at import time — callers (only ``main()`` /
+    ``run_server()``) trigger it so that importing the module as a library
+    does not reconfigure the host application's root logger.
+    """
     level = getattr(logging, get_config().server.log_level, logging.INFO)
     logging.basicConfig(level=level)
     logging.getLogger().setLevel(level)
 
-
-_configure_logging()
 
 server = Server("git-filter-repo-mcp")
 
@@ -262,7 +265,12 @@ async def _handle_rewrite_messages(args: dict) -> dict:
         except AIConnectionError as e:
             return {"success": False, "error": str(e), "error_code": ErrorCode.AI_CONNECTION_FAILED, "ai_provider": ai_provider_name}
         finally:
-            await engine.close()
+            # ``close()`` failures (e.g. httpx teardown) must NOT mask the
+            # handler's actual result/exception. Log and swallow.
+            try:
+                await engine.close()
+            except Exception:
+                logger.warning("AI engine close failed", exc_info=True)
 
     elif params.manual_mappings:
         mappings = params.manual_mappings
@@ -414,7 +422,12 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         except AIConnectionError as e:
             return {"success": False, "error": str(e), "error_code": ErrorCode.AI_CONNECTION_FAILED, "ai_provider": ai_provider_name}
         finally:
-            await engine.close()
+            # ``close()`` failures (e.g. httpx teardown) must NOT mask the
+            # handler's actual result/exception. Log and swallow.
+            try:
+                await engine.close()
+            except Exception:
+                logger.warning("AI engine close failed", exc_info=True)
 
     has_message_change = new_message and new_message != commit.message
     has_partial_author = bool(params.new_author_email) != bool(params.new_author_name)
@@ -580,6 +593,7 @@ async def run_server():
 
 def main():
     """Entry point."""
+    _configure_logging()
     try:
         asyncio.run(run_server())
     except KeyboardInterrupt:

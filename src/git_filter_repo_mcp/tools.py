@@ -28,7 +28,9 @@ class ErrorCode(str, Enum):
 class _RepoInput(BaseModel):
     """Base for any tool that targets a git repository."""
 
-    repo_path: str = Field(description="Path to the git repository")
+    repo_path: str = Field(
+        min_length=1, description="Path to the git repository",
+    )
 
 
 class _DestructiveRepoInput(_RepoInput):
@@ -76,15 +78,17 @@ class RewriteCommitMessagesInput(_DestructiveRepoInput):
 class ChangeAuthorInput(_DestructiveRepoInput):
     """Input for change_author tool."""
 
-    old_email: str = Field(description="Email address to replace")
-    new_name: str = Field(description="New author name")
-    new_email: str = Field(description="New author email")
+    old_email: str = Field(min_length=1, description="Email address to replace")
+    new_name: str = Field(min_length=1, description="New author name")
+    new_email: str = Field(min_length=1, description="New author email")
 
 
 class RemoveFilesInput(_DestructiveRepoInput):
     """Input for remove_files tool."""
 
-    paths: list[str] = Field(description="List of file paths to remove from history")
+    paths: list[str] = Field(
+        min_length=1, description="List of file paths to remove from history",
+    )
 
 
 class RemoveLargeFilesInput(_DestructiveRepoInput):
@@ -113,19 +117,23 @@ class CreateBackupInput(_RepoInput):
 class RestoreBackupInput(_RepoInput):
     """Input for restore_backup tool."""
 
-    backup_branch: str = Field(description="Name of the backup branch to restore")
+    backup_branch: str = Field(
+        min_length=1, description="Name of the backup branch to restore",
+    )
 
 
 class GetCommitDetailsInput(_RepoInput):
     """Input for get_commit_details tool."""
 
-    commit_hash: str = Field(description="Commit hash to get details for")
+    commit_hash: str = Field(
+        min_length=1, description="Commit hash to get details for",
+    )
 
 
 class RewriteSingleCommitInput(_DestructiveRepoInput):
     """Input for rewrite_single_commit tool."""
 
-    commit_hash: str = Field(description="Commit hash to rewrite")
+    commit_hash: str = Field(min_length=1, description="Commit hash to rewrite")
     new_message: str | None = Field(default=None, description="New commit message")
     new_author_name: str | None = Field(default=None, description="New author name")
     new_author_email: str | None = Field(default=None, description="New author email")
@@ -144,8 +152,10 @@ class ScanSecretsInput(_RepoInput):
 class SquashCommitsInput(_DestructiveRepoInput):
     """Input for squash_commits tool."""
 
-    start_commit: str = Field(description="Starting commit hash (exclusive)")
-    end_commit: str = Field(default="HEAD", description="Ending commit hash (inclusive)")
+    start_commit: str = Field(min_length=1, description="Starting commit hash (exclusive)")
+    end_commit: str = Field(
+        default="HEAD", min_length=1, description="Ending commit hash (inclusive)",
+    )
     new_message: str | None = Field(
         default=None, description="New commit message for squashed commit"
     )
@@ -174,8 +184,8 @@ class ChangeCommitDatesInput(_DestructiveRepoInput):
 class ReplaceTextInput(_DestructiveRepoInput):
     """Input for replace_text_in_history tool."""
 
-    old_text: str = Field(description="Text to find and replace")
-    new_text: str = Field(description="Replacement text")
+    old_text: str = Field(min_length=1, description="Text to find and replace")
+    new_text: str = Field(description="Replacement text")  # may be empty (deletion)
     file_pattern: str | None = Field(
         default=None, description="Glob pattern to filter files (e.g., '*.py')"
     )
@@ -184,13 +194,11 @@ class ReplaceTextInput(_DestructiveRepoInput):
 class GetFileHistoryInput(_RepoInput):
     """Input for get_file_history tool."""
 
-    file_path: str = Field(description="Path to the file")
+    file_path: str = Field(min_length=1, description="Path to the file")
 
 
 class ListAllFilesInput(_RepoInput):
     """Input for list_all_files_in_history tool."""
-
-    repo_path: str = Field(description="Path to the git repository")
 
 
 # Tool definitions for MCP registration

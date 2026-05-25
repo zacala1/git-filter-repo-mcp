@@ -64,7 +64,9 @@ class TestSensitiveFiles:
     @pytest.mark.parametrize(
         "path",
         [".env", ".env.local", ".env.production", "credentials.json",
-         "secrets.json", "id_rsa", "server.key", "cert.pem"],
+         "secrets.json", "id_rsa", "server.key", "cert.pem",
+         # Regression: Windows-style separator must not block matching.
+         "src\\firebase-adminsdk-abc.json", "configs\\.env"],
     )
     def test_sensitive(self, path: str) -> None:
         assert is_sensitive_file(path) is True

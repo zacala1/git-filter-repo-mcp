@@ -130,6 +130,9 @@ class TestPydanticInputValidation:
             (AnalyzeHistoryInput, {"repo_path": "/tmp", "max_count": 20000}),
             (RemoveLargeFilesInput, {"repo_path": "/tmp", "size_threshold_mb": 0.0}),
             (RemoveLargeFilesInput, {"repo_path": "/tmp", "size_threshold_mb": -5.0}),
+            # Regression: empty repo_path must be rejected at pydantic layer
+            # rather than crashing deep inside the adapter.
+            (AnalyzeHistoryInput, {"repo_path": ""}),
         ],
     )
     def test_out_of_range_rejected(self, model: type, kwargs: dict) -> None:
@@ -824,3 +827,20 @@ class TestServerLifecycle:
     def test_configure_logging_callable(self) -> None:
         from git_filter_repo_mcp.server import _configure_logging
         _configure_logging()  # must not raise
+
+    def test_import_does_not_reconfigure_root_logger(self) -> None:
+        """Importing the server module must NOT call ``logging.basicConfig``
+        — that would clobber the host application's logger setup. The
+        configuration must only run inside ``main()``."""
+        import importlib
+        import logging
+
+        root = logging.getLogger()
+        original_level = root.level
+
+        # Force re-import to trigger any import-time side effects.
+        import git_filter_repo_mcp.server as server_mod
+        importlib.reload(server_mod)
+
+        # The level must not have changed from import alone.
+        assert root.level == original_level

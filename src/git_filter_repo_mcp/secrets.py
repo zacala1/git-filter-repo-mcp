@@ -248,13 +248,19 @@ def scan_content(
 
 
 def is_sensitive_file(file_path: str) -> bool:
-    """Check if a file path matches sensitive file patterns."""
-    name = Path(file_path).name
+    """Check if a file path matches sensitive file patterns.
+
+    Normalises Windows-style backslash separators to forward slashes before
+    ``fnmatch`` so patterns like ``firebase-adminsdk*.json`` match on both
+    POSIX and Windows paths.
+    """
+    normalised = file_path.replace("\\", "/")
+    name = Path(normalised).name
 
     for pattern in SENSITIVE_FILES:
         if fnmatch.fnmatch(name, pattern):
             return True
-        if fnmatch.fnmatch(file_path, pattern):
+        if fnmatch.fnmatch(normalised, pattern):
             return True
 
     return False

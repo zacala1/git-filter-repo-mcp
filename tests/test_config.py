@@ -109,6 +109,32 @@ class TestApplyEnvVars:
         assert config.ai.model == "llama3.2"
         assert config.server.log_level == "INFO"
 
+    @pytest.mark.parametrize(
+        "env_var,bad_value,attr_path,kept_default",
+        [
+            ("GIT_FILTER_REPO_AI_PROVIDER", "garbage", "ai.provider", "ollama"),
+            ("GIT_FILTER_REPO_LOG_LEVEL", "FOOBAR", "server.log_level", "INFO"),
+        ],
+    )
+    def test_invalid_env_value_logged_and_skipped(
+        self, clean_env, env_var: str, bad_value: str,
+        attr_path: str, kept_default: str,
+    ) -> None:
+        """Invalid env values must not corrupt Config — defaults preserved."""
+        clean_env.setenv(env_var, bad_value)
+        config = Config()
+        _apply_env_vars(config)
+        obj = config
+        for part in attr_path.split("."):
+            obj = getattr(obj, part)
+        assert obj == kept_default
+
+    def test_log_level_case_normalised(self, clean_env) -> None:
+        clean_env.setenv("GIT_FILTER_REPO_LOG_LEVEL", "debug")
+        config = Config()
+        _apply_env_vars(config)
+        assert config.server.log_level == "DEBUG"
+
 
 class TestApplyConfigDict:
     """``_apply_config_dict`` merges a dict into a Config instance."""
@@ -191,6 +217,20 @@ class TestLoadConfig:
                 json.loads(cfg_path.read_text())
             # Sanity: defaults still intact on a fresh Config.
             assert Config().ai.provider == "ollama"
+
+    def test_utf8_bom_in_config_file_handled(self, tmp_path: Path) -> None:
+        """Config files saved by Windows tools (Notepad) often have a UTF-8
+        BOM; ``load_config`` must read them transparently."""
+        cfg_path = tmp_path / "config.json"
+        # Write JSON with a UTF-8 BOM prefix.
+        cfg_path.write_bytes(
+            "﻿".encode("utf-8")
+            + json.dumps({"ai": {"provider": "anthropic"}}).encode("utf-8")
+        )
+        config = Config()
+        with open(cfg_path, encoding="utf-8-sig") as f:
+            _apply_config_dict(config, json.load(f))
+        assert config.ai.provider == "anthropic"
 
 
 class TestCreateDefaultConfigFile:

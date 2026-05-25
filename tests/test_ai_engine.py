@@ -152,6 +152,17 @@ class TestParseResponse:
         out = provider._parse_response(f"{prefix} something", MessageStyle.CONVENTIONAL)
         assert not out.startswith(f"chore: {prefix}")
 
+    @pytest.mark.parametrize("empty", ["", "   ", '""', "''"])
+    def test_empty_response_falls_back_to_original(
+        self, provider: OllamaProvider, empty: str,
+    ) -> None:
+        """Empty AI output must NOT produce ``"chore: "`` — fall back to the
+        commit's original message instead."""
+        out = provider._parse_response(
+            empty, MessageStyle.CONVENTIONAL, fallback="original msg",
+        )
+        assert out == "original msg"
+
 
 # --- Provider init -------------------------------------------------------
 
@@ -414,6 +425,15 @@ class TestProviderClose:
         await AICommitEngine(provider=provider).close()
         provider.client.aclose.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_provider_close_is_idempotent(self) -> None:
+        """Calling ``close()`` twice must not raise or hit the network twice."""
+        provider = OllamaProvider()
+        provider.client = AsyncMock()
+        await provider.close()
+        await provider.close()  # must not raise
+        provider.client.aclose.assert_called_once()
+
 
 # --- Engine batch --------------------------------------------------------
 
@@ -441,6 +461,32 @@ class TestRewriteBatch:
             "rewritten: msg1", "rewritten: msg2", "rewritten: msg3",
         ]
         assert engine.rewrite_message.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_failure_in_one_task_does_not_drop_others(self) -> None:
+        """Regression for gather-cancels-siblings default: one task raising
+        must NOT lose results from the others. The failing commit keeps its
+        original message (no-op rewrite)."""
+        async def flaky_rewrite(message: str, commit_hash: str, files: list[str]) -> RewriteResult:
+            if commit_hash == "bad":
+                raise RuntimeError("transient AI error")
+            return RewriteResult(
+                original=message, rewritten=f"new: {message}", commit_hash=commit_hash,
+            )
+
+        engine = AICommitEngine()
+        engine.rewrite_message = flaky_rewrite  # type: ignore[assignment]
+        results = await engine.rewrite_batch([
+            ("ok1", "msg1", []),
+            ("bad", "msg2", []),
+            ("ok2", "msg3", []),
+        ])
+        assert len(results) == 3
+        # ok1 and ok2 succeed normally; bad keeps its original message.
+        rewrites = {r.commit_hash: r.rewritten for r in results}
+        assert rewrites["ok1"] == "new: msg1"
+        assert rewrites["ok2"] == "new: msg3"
+        assert rewrites["bad"] == "msg2"  # original preserved
 
     @pytest.mark.asyncio
     async def test_concurrency_limit_respected(self) -> None:

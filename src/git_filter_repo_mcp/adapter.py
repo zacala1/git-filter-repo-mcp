@@ -200,6 +200,14 @@ class GitFilterRepoAdapter:
         except subprocess.TimeoutExpired:
             logger.error("timeout %ds: %s", timeout, args[0])
             raise
+        except FileNotFoundError as e:
+            # The executable (typically ``git`` or ``git-filter-repo``) was not
+            # found on PATH. Re-raise as ``RuntimeError`` so the server's
+            # handler decorator converts it into a clean COMMAND_FAILED error
+            # envelope instead of an opaque INTERNAL_ERROR.
+            raise RuntimeError(
+                f"{args[0]} not found on PATH. Is it installed?"
+            ) from e
 
     def _run_git(self, *args: str, timeout: int = TIMEOUT_DEFAULT) -> subprocess.CompletedProcess:
         """Run a git command."""
@@ -1109,10 +1117,19 @@ class GitFilterRepoAdapter:
                 new_dt = new_dt.replace(hour=hour, minute=minute, second=second)
                 if new_dt <= prev_timestamp:
                     new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(1, 10))
-                current_date = new_dt
 
             if not found_valid and prev_timestamp:
                 new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 30))
+                # The 100-attempt loop exhausted without finding a valid weekend
+                # slot — push forward to the next Saturday rather than silently
+                # writing a weekday timestamp.
+                if weekend_only and new_dt.weekday() < 5:
+                    new_dt += datetime.timedelta(days=5 - new_dt.weekday())
+
+            # Track ``new_dt`` so subsequent commits advance forward in time
+            # (used to live inside the preserve_order branch, which meant
+            # later commits piled up around ``base`` without it).
+            current_date = new_dt
 
             date_mappings[commit_hash] = (int(new_dt.timestamp()), tz_offset)
             prev_timestamp = new_dt

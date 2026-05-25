@@ -173,7 +173,7 @@ class BaseProvider(ABC):
 
         try:
             raw = await self._call_api(prompt)
-            return self._parse_response(raw, style)
+            return self._parse_response(raw, style, fallback=context.original_message)
         except httpx.ConnectError as e:
             self._last_error = f"Cannot connect to {self.provider_name}"
             logger.warning("%s connect: %s", self.provider_name.lower(), e)
@@ -186,10 +186,28 @@ class BaseProvider(ABC):
             if self.raise_on_error:
                 raise AIConnectionError(self.provider_name, self._last_error, e)
             return context.original_message
+        except (ValueError, KeyError, TypeError) as e:
+            # ``response.json()`` raises ``json.JSONDecodeError`` (a ``ValueError``
+            # subclass) on malformed bodies; provider parsers can raise
+            # ``KeyError``/``TypeError`` on unexpected shapes. Treat all as
+            # connection-style failures so callers see a consistent envelope.
+            self._last_error = f"Malformed response from {self.provider_name}: {e}"
+            logger.warning("%s response: %s", self.provider_name.lower(), e)
+            if self.raise_on_error:
+                raise AIConnectionError(self.provider_name, self._last_error, e)
+            return context.original_message
 
-    def _parse_response(self, response: str, style: MessageStyle) -> str:
-        """Parse and normalize response text."""
+    def _parse_response(
+        self, response: str, style: MessageStyle, fallback: str = "",
+    ) -> str:
+        """Parse and normalize response text.
+
+        Guards against empty responses (which would otherwise produce a
+        degenerate ``"chore: "`` for conventional style).
+        """
         message = response.strip().strip("\"'")
+        if not message:
+            return fallback
 
         if style == MessageStyle.CONVENTIONAL:
             if not any(message.lower().startswith(p) for p in _CONVENTIONAL_PREFIXES):
@@ -198,6 +216,10 @@ class BaseProvider(ABC):
         return message
 
     async def close(self) -> None:
+        """Close the underlying httpx client. Idempotent — safe to call twice."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         await self.client.aclose()
 
 
@@ -419,7 +441,13 @@ class AICommitEngine:
         commits: list[tuple[str, str, list[str]]],
         max_concurrency: int = 5,
     ) -> list[RewriteResult]:
-        """Batch rewrite with bounded concurrency."""
+        """Batch rewrite with bounded concurrency.
+
+        Uses ``return_exceptions=True`` so a transient failure for one commit
+        doesn't cancel sibling tasks (gather's default behaviour). On failure,
+        the original message is preserved in the returned ``RewriteResult`` so
+        the downstream rewriter treats it as a no-op for that commit.
+        """
         if not commits:
             return []
 
@@ -429,9 +457,25 @@ class AICommitEngine:
             async with semaphore:
                 return await self.rewrite_message(message, commit_hash, files)
 
-        return list(await asyncio.gather(
-            *(_limited(h, m, f) for h, m, f in commits)
-        ))
+        raw_results = await asyncio.gather(
+            *(_limited(h, m, f) for h, m, f in commits),
+            return_exceptions=True,
+        )
+
+        results: list[RewriteResult] = []
+        for (commit_hash, message, _files), outcome in zip(commits, raw_results):
+            if isinstance(outcome, BaseException):
+                logger.warning(
+                    "rewrite_batch: keeping original message for %s due to %s",
+                    commit_hash[:8], outcome,
+                )
+                results.append(RewriteResult(
+                    original=message, rewritten=message, commit_hash=commit_hash,
+                    reasoning=f"AI call failed: {outcome}",
+                ))
+            else:
+                results.append(outcome)
+        return results
 
     async def close(self) -> None:
         await self.provider.close()

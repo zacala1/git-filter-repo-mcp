@@ -67,15 +67,19 @@ def load_config() -> Config:
     ]
 
     for config_path in config_paths:
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    data = json.load(f)
-                    _apply_config_dict(config, data)
-            except json.JSONDecodeError as e:
-                logger.warning("Failed to parse config file %s: %s", config_path, e)
-            except IOError as e:
-                logger.warning("Failed to read config file %s: %s", config_path, e)
+        try:
+            if not config_path.exists():
+                continue
+            # ``utf-8-sig`` transparently strips a UTF-8 BOM (common when the
+            # file was edited with Notepad on Windows).
+            with open(config_path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+                _apply_config_dict(config, data)
+        except json.JSONDecodeError as e:
+            logger.warning("Failed to parse config file %s: %s", config_path, e)
+        except OSError as e:
+            # IOError is an alias for OSError; also covers broken symlinks etc.
+            logger.warning("Failed to read config file %s: %s", config_path, e)
 
     _apply_env_vars(config)
 
@@ -109,10 +113,26 @@ def _apply_config_dict(config: Config, data: dict) -> None:
             config.server.auto_backup = server_data["auto_backup"]
 
 
+_VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic", "none"}
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+
 def _apply_env_vars(config: Config) -> None:
-    """Apply environment variables to config."""
+    """Apply environment variables to config.
+
+    Invalid values are logged and skipped rather than silently accepted —
+    downstream code annotates ``ai.provider`` as a ``Literal`` and
+    ``log_level`` as something ``logging.setLevel`` accepts, so an unchecked
+    typo would fail much later with a confusing error.
+    """
     if provider := os.getenv("GIT_FILTER_REPO_AI_PROVIDER"):
-        config.ai.provider = provider  # type: ignore[assignment]
+        if provider in _VALID_AI_PROVIDERS:
+            config.ai.provider = provider  # type: ignore[assignment]
+        else:
+            logger.warning(
+                "Ignoring GIT_FILTER_REPO_AI_PROVIDER=%r (valid: %s)",
+                provider, sorted(_VALID_AI_PROVIDERS),
+            )
 
     if model := os.getenv("GIT_FILTER_REPO_AI_MODEL"):
         config.ai.model = model
@@ -130,7 +150,14 @@ def _apply_env_vars(config: Config) -> None:
         config.ai.anthropic_api_key = anthropic_key
 
     if log_level := os.getenv("GIT_FILTER_REPO_LOG_LEVEL"):
-        config.server.log_level = log_level
+        normalised = log_level.upper()
+        if normalised in _VALID_LOG_LEVELS:
+            config.server.log_level = normalised
+        else:
+            logger.warning(
+                "Ignoring GIT_FILTER_REPO_LOG_LEVEL=%r (valid: %s)",
+                log_level, sorted(_VALID_LOG_LEVELS),
+            )
 
 
 def create_default_config_file(path: Path | None = None) -> Path:
