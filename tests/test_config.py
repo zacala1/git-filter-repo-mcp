@@ -16,6 +16,7 @@ from git_filter_repo_mcp.config import (
     _apply_env_vars,
     create_default_config_file,
     get_config,
+    load_config,
     reload_config,
 )
 
@@ -171,6 +172,48 @@ class TestApplyConfigDict:
         assert config.ai.provider == "ollama"
         assert config.server.log_level == "INFO"
 
+    @pytest.mark.parametrize(
+        "data,expected_log_level",
+        [
+            ({"ai": None, "server": {"log_level": "DEBUG"}}, "DEBUG"),
+            ({"ai": [], "server": {"log_level": "DEBUG"}}, "DEBUG"),
+            ({"server": None}, "INFO"),
+            ([], "INFO"),
+        ],
+    )
+    def test_malformed_sections_are_skipped(
+        self, data: object, expected_log_level: str,
+    ) -> None:
+        config = Config()
+        _apply_config_dict(config, data)
+        assert config.ai.provider == "ollama"
+        assert config.server.log_level == expected_log_level
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"ai": {"provider": "bogus"}},
+            {"server": {"log_level": "VERBOSE"}},
+            {"server": {"default_dry_run": "false"}},
+            {"server": {"auto_backup": 0}},
+            {"ai": {"model": 123, "ollama_base_url": False}},
+        ],
+    )
+    def test_invalid_config_values_are_skipped(self, data: dict) -> None:
+        config = Config()
+        _apply_config_dict(config, data)
+        assert config.ai.provider == "ollama"
+        assert config.ai.model == "llama3.2"
+        assert config.ai.ollama_base_url == "http://localhost:11434"
+        assert config.server.log_level == "INFO"
+        assert config.server.default_dry_run is True
+        assert config.server.auto_backup is True
+
+    def test_config_log_level_case_normalised(self) -> None:
+        config = Config()
+        _apply_config_dict(config, {"server": {"log_level": "debug"}})
+        assert config.server.log_level == "DEBUG"
+
 
 class TestPriority:
     """Resolution priority between file values and env vars.
@@ -191,6 +234,48 @@ class TestPriority:
 
 class TestLoadConfig:
     """``load_config`` reads JSON files defensively."""
+
+    def test_load_config_priority_user_local_env(
+        self, tmp_path: Path, clean_env, monkeypatch,
+    ) -> None:
+        home = tmp_path / "home"
+        user_config = home / ".config" / "git-filter-repo-mcp" / "config.json"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text(json.dumps({
+            "ai": {"provider": "openai", "model": "user-model"},
+            "server": {"log_level": "WARNING", "auto_backup": False},
+        }))
+        (tmp_path / "config.json").write_text(json.dumps({
+            "ai": {"provider": "anthropic"},
+            "server": {"log_level": "debug"},
+        }))
+
+        monkeypatch.chdir(tmp_path)
+        clean_env.setenv("GIT_FILTER_REPO_AI_MODEL", "env-model")
+        clean_env.setenv("GIT_FILTER_REPO_LOG_LEVEL", "ERROR")
+        with patch("git_filter_repo_mcp.config.Path.home", return_value=home):
+            config = load_config()
+
+        assert config.ai.provider == "anthropic"
+        assert config.ai.model == "env-model"
+        assert config.server.log_level == "ERROR"
+        assert config.server.auto_backup is False
+
+    def test_load_config_skips_bad_config_shape(
+        self, tmp_path: Path, clean_env, monkeypatch,
+    ) -> None:
+        home = tmp_path / "home"
+        (tmp_path / "config.json").write_text(json.dumps({
+            "ai": None,
+            "server": {"log_level": "debug"},
+        }))
+
+        monkeypatch.chdir(tmp_path)
+        with patch("git_filter_repo_mcp.config.Path.home", return_value=home):
+            config = load_config()
+
+        assert config.ai.provider == "ollama"
+        assert config.server.log_level == "DEBUG"
 
     def test_round_trip_via_dict(self) -> None:
         """Indirect: write a file, read it, apply it — covers the JSON read

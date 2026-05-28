@@ -46,6 +46,10 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
 
 
+_VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic", "none"}
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+
 def load_config() -> Config:
     """
     Load configuration from multiple sources (in priority order, highest first):
@@ -86,35 +90,89 @@ def load_config() -> Config:
     return config
 
 
-def _apply_config_dict(config: Config, data: dict) -> None:
+def _warn_invalid_value(source: str, value: object, valid_values: set[str] | None = None) -> None:
+    """Log a consistent warning for config values that cannot be applied."""
+    if valid_values:
+        logger.warning("Ignoring %s=%r (valid: %s)", source, value, sorted(valid_values))
+    else:
+        logger.warning("Ignoring %s=%r (invalid type)", source, value)
+
+
+def _apply_ai_provider(config: Config, provider: object, source: str) -> None:
+    """Apply an AI provider value after validating it."""
+    if isinstance(provider, str) and provider in _VALID_AI_PROVIDERS:
+        config.ai.provider = provider  # type: ignore[assignment]
+    else:
+        _warn_invalid_value(source, provider, _VALID_AI_PROVIDERS)
+
+
+def _apply_log_level(config: Config, log_level: object, source: str) -> None:
+    """Apply a logging level value after validating and normalising it."""
+    if isinstance(log_level, str):
+        normalised = log_level.upper()
+        if normalised in _VALID_LOG_LEVELS:
+            config.server.log_level = normalised
+            return
+    _warn_invalid_value(source, log_level, _VALID_LOG_LEVELS)
+
+
+def _apply_config_dict(config: Config, data: object) -> None:
     """Apply configuration from a dictionary."""
+    if not isinstance(data, dict):
+        _warn_invalid_value("config", data)
+        return
+
     if "ai" in data:
         ai_data = data["ai"]
-        if "provider" in ai_data:
-            config.ai.provider = ai_data["provider"]
-        if "model" in ai_data:
-            config.ai.model = ai_data["model"]
-        if "ollama_base_url" in ai_data:
-            config.ai.ollama_base_url = ai_data["ollama_base_url"]
-        if "openai_api_key" in ai_data:
-            config.ai.openai_api_key = ai_data["openai_api_key"]
-        if "openai_base_url" in ai_data:
-            config.ai.openai_base_url = ai_data["openai_base_url"]
-        if "anthropic_api_key" in ai_data:
-            config.ai.anthropic_api_key = ai_data["anthropic_api_key"]
+        if not isinstance(ai_data, dict):
+            _warn_invalid_value("ai", ai_data)
+        else:
+            if "provider" in ai_data:
+                _apply_ai_provider(config, ai_data["provider"], "ai.provider")
+            if "model" in ai_data:
+                if isinstance(ai_data["model"], str):
+                    config.ai.model = ai_data["model"]
+                else:
+                    _warn_invalid_value("ai.model", ai_data["model"])
+            if "ollama_base_url" in ai_data:
+                if isinstance(ai_data["ollama_base_url"], str):
+                    config.ai.ollama_base_url = ai_data["ollama_base_url"]
+                else:
+                    _warn_invalid_value("ai.ollama_base_url", ai_data["ollama_base_url"])
+            if "openai_api_key" in ai_data:
+                if isinstance(ai_data["openai_api_key"], str | type(None)):
+                    config.ai.openai_api_key = ai_data["openai_api_key"]
+                else:
+                    _warn_invalid_value("ai.openai_api_key", ai_data["openai_api_key"])
+            if "openai_base_url" in ai_data:
+                if isinstance(ai_data["openai_base_url"], str):
+                    config.ai.openai_base_url = ai_data["openai_base_url"]
+                else:
+                    _warn_invalid_value("ai.openai_base_url", ai_data["openai_base_url"])
+            if "anthropic_api_key" in ai_data:
+                if isinstance(ai_data["anthropic_api_key"], str | type(None)):
+                    config.ai.anthropic_api_key = ai_data["anthropic_api_key"]
+                else:
+                    _warn_invalid_value("ai.anthropic_api_key", ai_data["anthropic_api_key"])
 
     if "server" in data:
         server_data = data["server"]
+        if not isinstance(server_data, dict):
+            _warn_invalid_value("server", server_data)
+            return
+
         if "log_level" in server_data:
-            config.server.log_level = server_data["log_level"]
+            _apply_log_level(config, server_data["log_level"], "server.log_level")
         if "default_dry_run" in server_data:
-            config.server.default_dry_run = server_data["default_dry_run"]
+            if isinstance(server_data["default_dry_run"], bool):
+                config.server.default_dry_run = server_data["default_dry_run"]
+            else:
+                _warn_invalid_value("server.default_dry_run", server_data["default_dry_run"])
         if "auto_backup" in server_data:
-            config.server.auto_backup = server_data["auto_backup"]
-
-
-_VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic", "none"}
-_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+            if isinstance(server_data["auto_backup"], bool):
+                config.server.auto_backup = server_data["auto_backup"]
+            else:
+                _warn_invalid_value("server.auto_backup", server_data["auto_backup"])
 
 
 def _apply_env_vars(config: Config) -> None:
@@ -126,13 +184,7 @@ def _apply_env_vars(config: Config) -> None:
     typo would fail much later with a confusing error.
     """
     if provider := os.getenv("GIT_FILTER_REPO_AI_PROVIDER"):
-        if provider in _VALID_AI_PROVIDERS:
-            config.ai.provider = provider  # type: ignore[assignment]
-        else:
-            logger.warning(
-                "Ignoring GIT_FILTER_REPO_AI_PROVIDER=%r (valid: %s)",
-                provider, sorted(_VALID_AI_PROVIDERS),
-            )
+        _apply_ai_provider(config, provider, "GIT_FILTER_REPO_AI_PROVIDER")
 
     if model := os.getenv("GIT_FILTER_REPO_AI_MODEL"):
         config.ai.model = model
@@ -150,14 +202,7 @@ def _apply_env_vars(config: Config) -> None:
         config.ai.anthropic_api_key = anthropic_key
 
     if log_level := os.getenv("GIT_FILTER_REPO_LOG_LEVEL"):
-        normalised = log_level.upper()
-        if normalised in _VALID_LOG_LEVELS:
-            config.server.log_level = normalised
-        else:
-            logger.warning(
-                "Ignoring GIT_FILTER_REPO_LOG_LEVEL=%r (valid: %s)",
-                log_level, sorted(_VALID_LOG_LEVELS),
-            )
+        _apply_log_level(config, log_level, "GIT_FILTER_REPO_LOG_LEVEL")
 
 
 def create_default_config_file(path: Path | None = None) -> Path:

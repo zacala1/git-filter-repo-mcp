@@ -20,11 +20,17 @@ import platform
 import subprocess
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from git_filter_repo_mcp.adapter import CommitInfo, FilterResult, GitFilterRepoAdapter
+from git_filter_repo_mcp.adapter import (
+    MAX_FILES_TO_SCAN,
+    MAX_FINDINGS_LIMIT,
+    CommitInfo,
+    FilterResult,
+    GitFilterRepoAdapter,
+)
 from tests.conftest import add_commit, requires_git_filter_repo
 
 
@@ -99,6 +105,7 @@ class TestStaticValidators:
             '"; import os; os.system("rm -rf /"); "',  # code injection attempt
             "abc 123",                                  # whitespace
             "",                                         # empty
+            "abc",                                      # too short / overly broad
             "abc-123",                                  # punctuation
         ],
     )
@@ -110,9 +117,9 @@ class TestStaticValidators:
     def test_valid_ref_accepted(self, ref: str) -> None:
         _make_mock_adapter()._validate_ref(ref)
 
-    @pytest.mark.parametrize("bad_ref", ["--exec=evil", "-n5"])
+    @pytest.mark.parametrize("bad_ref", ["--exec=evil", "-n5", "", "HEAD\nmain"])
     def test_dash_prefixed_ref_rejected(self, bad_ref: str) -> None:
-        with pytest.raises(ValueError, match="must not start with"):
+        with pytest.raises(ValueError, match="Invalid ref"):
             _make_mock_adapter()._validate_ref(bad_ref)
 
     def test_valid_paths_accepted(self) -> None:
@@ -123,11 +130,20 @@ class TestStaticValidators:
         [
             (["--commit-callback"], "must not start with"),
             (["valid.py", ""], "empty string"),
+            (["bad\npath.txt"], "control characters"),
         ],
     )
     def test_invalid_paths_rejected(self, paths: list[str], error_fragment: str) -> None:
         with pytest.raises(ValueError, match=error_fragment):
             _make_mock_adapter()._validate_paths(paths)
+
+    def test_collect_commit_files_rejects_bad_branch(self) -> None:
+        with pytest.raises(ValueError, match="Invalid ref"):
+            _make_mock_adapter().collect_commit_files([], "--all", 1)
+
+    def test_collect_commit_files_rejects_negative_limit(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            _make_mock_adapter().collect_commit_files([], "HEAD", -1)
 
 
 class TestRepoInitErrors:
@@ -175,6 +191,7 @@ class TestParseTimeRange:
             ("invalid", "Unknown time range"),
             ("25:00-30:00", "out of range"),
             ("10:70-22:00", "out of range"),
+            ("18:30-18:00", "Invalid time range"),
         ],
     )
     def test_invalid_spec(self, bad_spec: str, error_fragment: str) -> None:
@@ -233,6 +250,156 @@ class TestGenerateDateMappings:
             if prev_ts is not None:
                 assert ts > prev_ts
             prev_ts = ts
+
+    def test_preserve_order_advances_to_next_window_not_outside_range(self) -> None:
+        commits = [
+            _commit_info(i, f"2024-01-0{i + 1}T10:00:00+00:00")
+            for i in range(3)
+        ]
+        with (
+            patch.object(GitFilterRepoAdapter, "_pick_random_time", return_value=(19, 0, 0)),
+            patch("git_filter_repo_mcp.adapter.random.random", return_value=1.0),
+        ):
+            result = _make_mock_adapter()._generate_date_mappings(
+                commits, 19, 0, 19, 0, False, True, None,
+            )
+
+        assert isinstance(result, dict) and len(result) == 3
+        timestamps = [ts for ts, _tz in result.values()]
+        assert timestamps == sorted(timestamps)
+        for ts in timestamps:
+            dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+            assert (dt.hour, dt.minute, dt.second) == (19, 0, 0)
+
+
+class TestRewriteSingleCommitUnit:
+    """Single-commit rewrite checks that do not need git-filter-repo."""
+
+    def test_dry_run_resolves_hash_without_running_filter_repo(self) -> None:
+        adapter = _make_mock_adapter()
+        resolved = "a" * 40
+        adapter._run_git = MagicMock(  # type: ignore[method-assign]
+            return_value=subprocess.CompletedProcess(["git"], 0, stdout=f"{resolved}\n", stderr="")
+        )
+        adapter._run_filter_repo = MagicMock()  # type: ignore[method-assign]
+
+        result = adapter.rewrite_single_commit("a" * 8, new_message="new", dry_run=True)
+
+        assert result.success and result.dry_run
+        assert result.commits_processed == 1
+        adapter._run_filter_repo.assert_not_called()
+
+    def test_uses_resolved_full_hash_for_callback_target(self) -> None:
+        adapter = _make_mock_adapter()
+        resolved = "b" * 40
+        adapter._run_git = MagicMock(  # type: ignore[method-assign]
+            return_value=subprocess.CompletedProcess(["git"], 0, stdout=f"{resolved}\n", stderr="")
+        )
+        adapter._build_callback = MagicMock(return_value="callback")  # type: ignore[method-assign]
+        adapter._run_filter_repo = MagicMock(  # type: ignore[method-assign]
+            return_value=subprocess.CompletedProcess(["git-filter-repo"], 0, stdout="", stderr="")
+        )
+
+        result = adapter.rewrite_single_commit("b" * 8, new_message="new", force=False)
+
+        assert result.success
+        payload = adapter._build_callback.call_args.args[0]
+        assert payload["_PAYLOAD"]["target"] == resolved
+        adapter._run_filter_repo.assert_called_once_with(
+            "--commit-callback", "callback", dry_run=False, force=False,
+        )
+
+    def test_missing_commit_does_not_run_filter_repo(self) -> None:
+        adapter = _make_mock_adapter()
+        adapter._run_git = MagicMock(  # type: ignore[method-assign]
+            side_effect=subprocess.CalledProcessError(
+                128, ["git"], stderr="fatal: Needed a single revision"
+            )
+        )
+        adapter._run_filter_repo = MagicMock()  # type: ignore[method-assign]
+
+        result = adapter.rewrite_single_commit("c" * 8, new_message="new")
+
+        assert result.success is False
+        assert "not found or ambiguous" in result.message
+        adapter._run_filter_repo.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"new_author_name": "Bad\nName"},
+            {"new_author_email": "bad@example.com> <extra@example.com"},
+            {"new_message": "bad\x00message"},
+        ],
+    )
+    def test_invalid_rewrite_values_rejected_before_git(self, kwargs: dict) -> None:
+        adapter = _make_mock_adapter()
+        adapter._run_git = MagicMock()  # type: ignore[method-assign]
+
+        result = adapter.rewrite_single_commit("d" * 8, **kwargs)
+
+        assert result.success is False
+        adapter._run_git.assert_not_called()
+
+
+class TestRewriteMessagesUnit:
+    """Message rewrite no-op behaviour without spawning git-filter-repo."""
+
+    def test_no_changes_does_not_run_filter_repo(self) -> None:
+        adapter = _make_mock_adapter()
+        adapter.get_commits = MagicMock(return_value=[_commit_info(1)])  # type: ignore[method-assign]
+        adapter._run_filter_repo = MagicMock()  # type: ignore[method-assign]
+
+        result = adapter.rewrite_commit_messages(lambda msg, _hash: msg, dry_run=False)
+
+        assert result.success
+        assert result.commits_rewritten == 0
+        adapter._run_filter_repo.assert_not_called()
+
+
+class TestSquashCommitsUnit:
+    """Safety checks in squash before it mutates HEAD/index."""
+
+    @staticmethod
+    def _cp(stdout: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(["git"], 0, stdout=stdout, stderr="")
+
+    def test_dry_run_rejects_non_head_end_commit(self) -> None:
+        adapter = _make_mock_adapter()
+
+        def run_git(*args: str, **_kwargs) -> subprocess.CompletedProcess:
+            if args[:2] == ("rev-list", "--count"):
+                return self._cp("2\n")
+            if args == ("rev-parse", "HEAD"):
+                return self._cp("head\n")
+            if args == ("rev-parse", "feature"):
+                return self._cp("feature\n")
+            raise AssertionError(f"unexpected git args: {args}")
+
+        adapter._run_git = MagicMock(side_effect=run_git)  # type: ignore[method-assign]
+
+        result = adapter.squash_commits("base", "feature", dry_run=True)
+
+        assert result.success is False
+        assert "must be HEAD" in result.message
+
+    def test_non_dry_run_requires_clean_worktree(self) -> None:
+        adapter = _make_mock_adapter()
+
+        def run_git(*args: str, **_kwargs) -> subprocess.CompletedProcess:
+            if args[:2] == ("rev-list", "--count"):
+                return self._cp("2\n")
+            if args == ("rev-parse", "HEAD"):
+                return self._cp("head\n")
+            raise AssertionError(f"unexpected git args: {args}")
+
+        adapter._run_git = MagicMock(side_effect=run_git)  # type: ignore[method-assign]
+        adapter._run_git_fast = MagicMock(return_value=self._cp(" M dirty.txt\n"))  # type: ignore[method-assign]
+
+        result = adapter.squash_commits("base", "HEAD", dry_run=False)
+
+        assert result.success is False
+        assert "Working tree must be clean" in result.message
 
 
 class TestBackupBranchFormat:
@@ -309,6 +476,52 @@ class TestReadOperations:
         self, adapter: GitFilterRepoAdapter,
     ) -> None:
         assert adapter.get_file_history("nonexistent.txt") == []
+
+    def test_validate_repo_safety_clean_repo(self, adapter: GitFilterRepoAdapter) -> None:
+        result = adapter.validate_repo_safety()
+        assert result["is_clean"] is True
+        assert result["safe_for_rewrite"] is True
+        assert result["head"]
+
+    def test_validate_repo_safety_detects_dirty_worktree(
+        self, adapter: GitFilterRepoAdapter, temp_git_repo: Path,
+    ) -> None:
+        (temp_git_repo / "uncommitted.txt").write_text("dirty")
+
+        result = adapter.validate_repo_safety()
+
+        assert result["is_clean"] is False
+        assert result["safe_for_rewrite"] is False
+        assert result["dirty_count"] >= 1
+        assert any("uncommitted.txt" in entry for entry in result["dirty_entries"])
+        assert "Working tree has uncommitted changes" in result["warnings"]
+
+    def test_resolve_commit_ref_head(self, adapter: GitFilterRepoAdapter) -> None:
+        result = adapter.resolve_commit_ref("HEAD")
+        assert result is not None
+        assert result["hash"] == adapter.get_commits()[0].hash
+        assert result["hash_short"] == result["hash"][:8]
+
+    def test_find_large_files_read_only_no_match(self, adapter: GitFilterRepoAdapter) -> None:
+        result = adapter.find_large_files(size_threshold_mb=100.0, limit=10)
+        assert result["total_large_files"] == 0
+        assert result["large_files"] == []
+
+    def test_find_large_files_returns_sorted_limited_results(
+        self, adapter: GitFilterRepoAdapter, temp_git_repo: Path,
+    ) -> None:
+        (temp_git_repo / "large.bin").write_bytes(b"x" * 2048)
+        (temp_git_repo / "huge.bin").write_bytes(b"y" * 4096)
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add large files"], cwd=temp_git_repo, capture_output=True)
+
+        result = adapter.find_large_files(size_threshold_mb=0.001, limit=1)
+
+        assert result["total_large_files"] >= 2
+        assert result["returned"] == 1
+        assert result["truncated"] is True
+        assert result["large_files"][0]["path"] == "huge.bin"
+        assert result["large_files"][0]["size_mb"] > 0.001
 
 
 @requires_git_filter_repo
@@ -701,6 +914,12 @@ class TestBackupAndRestore:
         )
         assert backup in listing.stdout
 
+    def test_list_backups(self, adapter: GitFilterRepoAdapter) -> None:
+        backup = adapter.create_backup()
+        result = adapter.list_backups()
+        assert backup in result["backups"]
+        assert result["total_backups"] >= 1
+
     def test_restore_returns_to_backup_state(
         self, adapter: GitFilterRepoAdapter, temp_git_repo: Path,
     ) -> None:
@@ -731,6 +950,7 @@ class TestBackupAndRestore:
             ("main", "Invalid backup branch"),
             ("backup_; rm -rf /", "Invalid backup branch"),
             ("backup_2024-01-01", "Invalid backup branch"),
+            ("backup_123", "Invalid backup branch"),
         ],
     )
     def test_invalid_branch_name_rejected(
@@ -933,6 +1153,44 @@ class TestScanSecrets:
         result = GitFilterRepoAdapter(str(temp_git_repo)).scan_secrets()
         env_entries = [f for f in result["sensitive_file_list"] if f["file"] == ".env"]
         assert len(env_entries) == 1
+
+    def test_scan_secrets_includes_limit_metadata(self, adapter: GitFilterRepoAdapter) -> None:
+        result = adapter.scan_secrets()
+        assert "scan_limits" in result
+        assert "files_considered" in result
+        assert "files_truncated" in result
+        assert "findings_truncated" in result
+
+    def test_scan_secrets_reports_file_scan_truncation(
+        self, adapter: GitFilterRepoAdapter, temp_git_repo: Path,
+    ) -> None:
+        for i in range(MAX_FILES_TO_SCAN + 5):
+            (temp_git_repo / f"candidate-{i:03d}.txt").write_text("clean")
+        subprocess.run(["git", "add", "."], cwd=temp_git_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add many files"], cwd=temp_git_repo, capture_output=True)
+
+        result = adapter.scan_secrets(max_commits=1)
+
+        assert result["files_considered"] == MAX_FILES_TO_SCAN + 5
+        assert result["files_scanned"] == MAX_FILES_TO_SCAN
+        assert result["files_truncated"] is True
+        assert result["scan_limits"]["max_files_to_scan"] == MAX_FILES_TO_SCAN
+
+    def test_scan_secrets_reports_finding_truncation(
+        self, adapter: GitFilterRepoAdapter, temp_git_repo: Path,
+    ) -> None:
+        secrets = "\n".join(
+            f"AKIA{i:016d}"
+            for i in range(MAX_FINDINGS_LIMIT + 5)
+        )
+        add_commit(temp_git_repo, "many-secrets.txt", secrets, "add many secrets")
+
+        result = adapter.scan_secrets(max_commits=1)
+
+        assert result["secrets_found"] == MAX_FINDINGS_LIMIT
+        assert len(result["findings"]) == MAX_FINDINGS_LIMIT
+        assert result["findings_truncated"] is True
+        assert result["scan_limits"]["max_findings"] == MAX_FINDINGS_LIMIT
 
 
 @requires_git_filter_repo

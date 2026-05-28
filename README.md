@@ -74,13 +74,16 @@ Add to Claude Desktop config:
 | `OPENAI_BASE_URL` | OpenAI-compatible API base URL | `https://api.openai.com/v1` |
 | `ANTHROPIC_API_KEY` | Anthropic API key | - |
 
-## Tools (16)
+## Tools (20)
 
 ### Analysis (read-only)
 
 | Tool | Description |
 |------|-------------|
 | `analyze_git_history` | Commit stats, author breakdown, recent commits |
+| `validate_repo_safety` | Check branch, HEAD, clean worktree, upstream, backups before rewrites |
+| `find_large_files` | Read-only large file discovery before removal |
+| `resolve_commit` | Resolve a commit ref to a full hash and metadata |
 | `get_commit_details` | Full details for a specific commit |
 | `get_file_history` | Commit history for a specific file |
 | `list_all_files_in_history` | All files that ever existed in the repo |
@@ -105,18 +108,22 @@ Add to Claude Desktop config:
 | Tool | Description |
 |------|-------------|
 | `create_backup` | Create a backup branch |
+| `list_backups` | List available backup branches |
 | `restore_backup` | Restore from a backup branch |
 
 ## Usage Examples
 
 ```text
 "Analyze /path/to/repo"
+"Validate repo safety before rewriting"
+"Find large files over 25MB"
 "Rewrite commits to conventional format"
 "Remove secrets.json from history"
 "Change author old@email.com to new@email.com"
 "Move commits to evening hours"
 "Find files larger than 10MB"
 "Scan for API keys"
+"List backup branches"
 "Squash the last 3 commits"
 ```
 

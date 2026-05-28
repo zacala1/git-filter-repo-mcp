@@ -17,23 +17,28 @@ from .ai_engine import AICommitEngine, AIConnectionError, MessageStyle, get_prov
 from .config import get_config
 from .tools import (
     TOOL_DEFINITIONS,
+    DESTRUCTIVE_TOOL_NAMES,
     AnalyzeHistoryInput,
     ErrorCode,
     ChangeAuthorInput,
     ChangeCommitDatesInput,
     CreateBackupInput,
+    FindLargeFilesInput,
     FilterPathsInput,
     GetCommitDetailsInput,
     GetFileHistoryInput,
     ListAllFilesInput,
+    ListBackupsInput,
     RemoveFilesInput,
     RemoveLargeFilesInput,
     ReplaceTextInput,
     RestoreBackupInput,
+    ResolveCommitInput,
     RewriteCommitMessagesInput,
     RewriteSingleCommitInput,
     ScanSecretsInput,
     SquashCommitsInput,
+    ValidateRepoSafetyInput,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +61,13 @@ server = Server("git-filter-repo-mcp")
 _HANDLERS: dict[str, Callable] = {}
 
 
+def _apply_default_dry_run(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Fill omitted dry_run from config for destructive tools."""
+    if name in DESTRUCTIVE_TOOL_NAMES and "dry_run" not in args:
+        return {**args, "dry_run": get_config().server.default_dry_run}
+    return args
+
+
 def tool_handler(name: str):
     """Register an async function as the handler for a named tool."""
     def decorator(func: Callable):
@@ -72,7 +84,17 @@ def tool_handler(name: str):
                 return {"success": False, "error": f"Invalid input: {details}", "error_code": ErrorCode.INVALID_INPUT}
             except ValueError as e:
                 msg = str(e)
-                code = ErrorCode.REPO_NOT_FOUND if ("Not a git repository" in msg or "does not exist" in msg) else ErrorCode.COMMAND_FAILED
+                if "Not a git repository" in msg or "does not exist" in msg:
+                    code = ErrorCode.REPO_NOT_FOUND
+                elif (
+                    "must " in msg
+                    or " required" in msg
+                    or msg.startswith("Invalid ")
+                    or msg.startswith("Unknown provider")
+                ):
+                    code = ErrorCode.INVALID_INPUT
+                else:
+                    code = ErrorCode.COMMAND_FAILED
                 return {"success": False, "error": msg, "error_code": code}
             except RuntimeError as e:
                 return {"success": False, "error": str(e), "error_code": ErrorCode.COMMAND_FAILED}
@@ -133,6 +155,22 @@ def _run_destructive(
 
 
 _VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic"}
+_CONFIG_DEFAULT_AI_MODEL = "llama3.2"
+_PROVIDER_DEFAULT_MODELS = {
+    "ollama": "llama3.2",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-sonnet-4-20250514",
+}
+
+
+def _resolve_ai_model(args: dict, provider_name: str, configured_model: str) -> str:
+    """Choose a provider-appropriate model unless the user configured one."""
+    if model := args.get("ai_model"):
+        return model
+
+    if provider_name == "ollama" or configured_model != _CONFIG_DEFAULT_AI_MODEL:
+        return configured_model
+    return _PROVIDER_DEFAULT_MODELS[provider_name]
 
 
 def _create_ai_provider(args: dict, provider_name: str):
@@ -145,7 +183,7 @@ def _create_ai_provider(args: dict, provider_name: str):
             f"Invalid AI provider: {provider_name!r}. Must be one of: {', '.join(sorted(_VALID_AI_PROVIDERS))}"
         )
     cfg = get_config()
-    kwargs: dict = {"model": args.get("ai_model") or cfg.ai.model}
+    kwargs: dict = {"model": _resolve_ai_model(args, provider_name, cfg.ai.model)}
     if provider_name == "ollama":
         kwargs["base_url"] = cfg.ai.ollama_base_url
     elif provider_name == "openai":
@@ -154,6 +192,16 @@ def _create_ai_provider(args: dict, provider_name: str):
     elif provider_name == "anthropic":
         kwargs["api_key"] = cfg.ai.anthropic_api_key
     return get_provider(provider_name, **kwargs)
+
+
+def _ai_provider_config_error(provider_name: str, error: Exception) -> dict:
+    """Return a consistent envelope for provider selection/config failures."""
+    return {
+        "success": False,
+        "error": f"AI provider '{provider_name}' is not configured: {error}",
+        "error_code": ErrorCode.INVALID_INPUT,
+        "ai_provider": provider_name,
+    }
 
 
 async def _check_ai_connection(provider, provider_name: str) -> dict | None:
@@ -183,6 +231,65 @@ async def _handle_analyze(args: dict) -> dict:
     return await asyncio.to_thread(_run)
 
 
+@tool_handler("validate_repo_safety")
+async def _handle_validate_repo_safety(args: dict) -> dict:
+    params = ValidateRepoSafetyInput(**args)
+
+    def _run():
+        return {
+            "success": True,
+            **GitFilterRepoAdapter(params.repo_path).validate_repo_safety(),
+        }
+
+    return await asyncio.to_thread(_run)
+
+
+@tool_handler("find_large_files")
+async def _handle_find_large_files(args: dict) -> dict:
+    params = FindLargeFilesInput(**args)
+
+    def _run():
+        return {
+            "success": True,
+            **GitFilterRepoAdapter(params.repo_path).find_large_files(
+                params.size_threshold_mb,
+                params.limit,
+            ),
+        }
+
+    return await asyncio.to_thread(_run)
+
+
+@tool_handler("list_backups")
+async def _handle_list_backups(args: dict) -> dict:
+    params = ListBackupsInput(**args)
+
+    def _run():
+        return {
+            "success": True,
+            **GitFilterRepoAdapter(params.repo_path).list_backups(params.limit),
+        }
+
+    return await asyncio.to_thread(_run)
+
+
+@tool_handler("resolve_commit")
+async def _handle_resolve_commit(args: dict) -> dict:
+    params = ResolveCommitInput(**args)
+
+    def _run():
+        resolved = GitFilterRepoAdapter(params.repo_path).resolve_commit_ref(params.commit_ref)
+        if resolved is None:
+            return {
+                "success": False,
+                "error": f"Commit ref not found: {params.commit_ref}",
+                "error_code": ErrorCode.INVALID_INPUT,
+            }
+        return {"success": True, "commit": resolved}
+
+    return await asyncio.to_thread(_run)
+
+
 @tool_handler("rewrite_commit_messages")
 async def _handle_rewrite_messages(args: dict) -> dict:
     params = RewriteCommitMessagesInput(**args)
@@ -204,7 +311,10 @@ async def _handle_rewrite_messages(args: dict) -> dict:
         ai_provider_name = params.ai_provider or get_config().ai.provider
         if ai_provider_name == "none":
             return {"success": False, "error": "AI provider is set to 'none'. Configure a provider or pass ai_provider explicitly.", "error_code": ErrorCode.INVALID_INPUT}
-        provider = _create_ai_provider(args, ai_provider_name)
+        try:
+            provider = _create_ai_provider(args, ai_provider_name)
+        except ValueError as e:
+            return _ai_provider_config_error(ai_provider_name, e)
         engine = AICommitEngine(provider, MessageStyle(params.style))
 
         try:
@@ -221,6 +331,18 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                 for c in commits
             ]
             results = await engine.rewrite_batch(batch_input)
+            ai_failures = [
+                r for r in results
+                if r.reasoning and r.reasoning.startswith("AI call failed")
+            ]
+            if results and len(ai_failures) == len(results):
+                return {
+                    "success": False,
+                    "error": "AI failed to rewrite all commit messages",
+                    "error_code": ErrorCode.AI_CONNECTION_FAILED,
+                    "ai_provider": ai_provider_name,
+                    "ai_failures": len(ai_failures),
+                }
 
             rewrites = []
             for commit, result in zip(commits, results):
@@ -243,10 +365,16 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                     ],
                     "total_rewrites": len(rewrites),
                     "ai_provider": ai_provider_name,
+                    "ai_failures": len(ai_failures),
                 }
 
             if not rewrites:
-                return {"success": True, "message": "No commits need rewriting", "ai_provider": ai_provider_name}
+                return {
+                    "success": True,
+                    "message": "No commits need rewriting",
+                    "ai_provider": ai_provider_name,
+                    "ai_failures": len(ai_failures),
+                }
 
             backup = _maybe_backup(adapter, dry_run)
             rewrite_by_hash = {r["hash"]: r["new"] for r in rewrites}
@@ -259,6 +387,7 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                 sync_callback, branch=params.branch, dry_run=False, force=True,
             )
             response = result_to_dict(result)
+            response["ai_failures"] = len(ai_failures)
             if backup:
                 response["backup_branch"] = backup
             return response
@@ -411,7 +540,10 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         ai_provider_name = params.ai_provider or get_config().ai.provider
         if ai_provider_name == "none":
             return {"success": False, "error": "AI provider is set to 'none'. Configure a provider or pass ai_provider explicitly.", "error_code": ErrorCode.INVALID_INPUT}
-        provider = _create_ai_provider(args, ai_provider_name)
+        try:
+            provider = _create_ai_provider(args, ai_provider_name)
+        except ValueError as e:
+            return _ai_provider_config_error(ai_provider_name, e)
         engine = AICommitEngine(provider, MessageStyle.CONVENTIONAL)
         try:
             if err := await _check_ai_connection(provider, ai_provider_name):
@@ -566,12 +698,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps({"error": str(e), "success": False}, indent=2))]
 
 
-async def _execute_tool(name: str, args: dict[str, Any]) -> dict:
+async def _execute_tool(name: str, args: dict[str, Any] | None) -> dict:
     """Dispatch tool execution to registered handler."""
     logger.info("tool: %s", name)
     handler = _HANDLERS.get(name)
     if handler is None:
         return {"success": False, "error": f"Unknown tool: {name}", "error_code": ErrorCode.TOOL_NOT_FOUND}
+    if args is None:
+        args = {}
+    elif not isinstance(args, dict):
+        return {
+            "success": False,
+            "error": "Tool arguments must be a JSON object",
+            "error_code": ErrorCode.INVALID_INPUT,
+        }
+    args = _apply_default_dry_run(name, args)
     return await handler(args)
 
 
@@ -594,13 +735,16 @@ async def run_server():
 def main():
     """Entry point."""
     _configure_logging()
+    server_coro = run_server()
     try:
-        asyncio.run(run_server())
+        asyncio.run(server_coro)
     except KeyboardInterrupt:
         logger.info("stopped")
     except Exception:
         logger.exception("fatal")
         raise SystemExit(1)
+    finally:
+        server_coro.close()
 
 
 if __name__ == "__main__":

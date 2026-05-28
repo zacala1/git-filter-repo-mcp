@@ -4,13 +4,23 @@ import json
 
 import pytest
 
-from git_filter_repo_mcp.tools import TOOL_DEFINITIONS, ErrorCode
+from git_filter_repo_mcp.tools import (
+    DESTRUCTIVE_TOOL_NAMES,
+    TOOL_DEFINITIONS,
+    TOOL_NAMES,
+    TOOL_SPECS,
+    ErrorCode,
+)
 
 
 # Canonical list of tool names the server must expose. Adding/removing a
 # tool requires updating this set, which forces a deliberate review.
 EXPECTED_TOOLS: frozenset[str] = frozenset({
     "analyze_git_history",
+    "validate_repo_safety",
+    "find_large_files",
+    "list_backups",
+    "resolve_commit",
     "rewrite_commit_messages",
     "change_author",
     "remove_files_from_history",
@@ -29,17 +39,7 @@ EXPECTED_TOOLS: frozenset[str] = frozenset({
 })
 
 # Tools that mutate history and therefore MUST expose ``dry_run``.
-DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
-    "rewrite_commit_messages",
-    "change_author",
-    "remove_files_from_history",
-    "remove_large_files",
-    "filter_paths",
-    "squash_commits",
-    "replace_text_in_history",
-    "rewrite_single_commit",
-    "change_commit_dates",
-})
+DESTRUCTIVE_TOOLS = DESTRUCTIVE_TOOL_NAMES
 
 
 class TestToolDefinitions:
@@ -50,6 +50,12 @@ class TestToolDefinitions:
         assert names == EXPECTED_TOOLS, (
             f"missing={EXPECTED_TOOLS - names}, extra={names - EXPECTED_TOOLS}"
         )
+        assert TOOL_NAMES == EXPECTED_TOOLS
+
+    def test_tool_specs_drive_definitions(self) -> None:
+        assert [spec.name for spec in TOOL_SPECS] == [
+            tool["name"] for tool in TOOL_DEFINITIONS
+        ]
 
     def test_names_are_unique(self) -> None:
         names = [tool["name"] for tool in TOOL_DEFINITIONS]

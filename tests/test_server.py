@@ -32,8 +32,18 @@ from git_filter_repo_mcp.server import (
 )
 from git_filter_repo_mcp.tools import (
     AnalyzeHistoryInput,
+    ChangeAuthorInput,
+    ChangeCommitDatesInput,
+    FindLargeFilesInput,
+    FilterPathsInput,
+    GetFileHistoryInput,
+    ListBackupsInput,
     RemoveLargeFilesInput,
+    RemoveFilesInput,
+    ReplaceTextInput,
+    ResolveCommitInput,
     RewriteCommitMessagesInput,
+    RewriteSingleCommitInput,
     ErrorCode,
 )
 
@@ -130,6 +140,9 @@ class TestPydanticInputValidation:
             (AnalyzeHistoryInput, {"repo_path": "/tmp", "max_count": 20000}),
             (RemoveLargeFilesInput, {"repo_path": "/tmp", "size_threshold_mb": 0.0}),
             (RemoveLargeFilesInput, {"repo_path": "/tmp", "size_threshold_mb": -5.0}),
+            (FindLargeFilesInput, {"repo_path": "/tmp", "limit": 0}),
+            (FindLargeFilesInput, {"repo_path": "/tmp", "limit": 1001}),
+            (ListBackupsInput, {"repo_path": "/tmp", "limit": 0}),
             # Regression: empty repo_path must be rejected at pydantic layer
             # rather than crashing deep inside the adapter.
             (AnalyzeHistoryInput, {"repo_path": ""}),
@@ -151,6 +164,93 @@ class TestPydanticInputValidation:
         params = RewriteCommitMessagesInput(repo_path="/tmp", style=style)  # type: ignore[arg-type]
         assert params.style == style
 
+    @pytest.mark.parametrize(
+        "model,kwargs,error_fragment",
+        [
+            (AnalyzeHistoryInput, {"repo_path": "/tmp", "branch": "--exec=evil"}, "branch"),
+            (ResolveCommitInput, {"repo_path": "/tmp", "commit_ref": "--all"}, "commit_ref"),
+            (RewriteCommitMessagesInput, {"repo_path": "/tmp", "branch": "-n5"}, "branch"),
+            (RemoveFilesInput, {"repo_path": "/tmp", "paths": ["--force"]}, "path"),
+            (RemoveFilesInput, {"repo_path": "/tmp", "paths": ["bad\npath"]}, "path"),
+            (GetFileHistoryInput, {"repo_path": "/tmp", "file_path": "--force"}, "file_path"),
+            (
+                ChangeAuthorInput,
+                {
+                    "repo_path": "/tmp",
+                    "old_email": "old@example.com",
+                    "new_name": "Bad\nName",
+                    "new_email": "new@example.com",
+                },
+                "new_name",
+            ),
+            (
+                ReplaceTextInput,
+                {"repo_path": "/tmp", "old_text": "a\nb", "new_text": "x"},
+                "old_text",
+            ),
+            (
+                ReplaceTextInput,
+                {"repo_path": "/tmp", "old_text": "a", "new_text": "x", "file_pattern": "--all"},
+                "file_pattern",
+            ),
+            (
+                ChangeCommitDatesInput,
+                {"repo_path": "/tmp", "time_range": "25:00-26:00"},
+                "time_range",
+            ),
+            (
+                ChangeCommitDatesInput,
+                {"repo_path": "/tmp", "start_date": "2024-99-99"},
+                "start_date",
+            ),
+        ],
+    )
+    def test_input_security_validation(
+        self, model: type, kwargs: dict, error_fragment: str,
+    ) -> None:
+        with pytest.raises(Exception) as excinfo:  # pydantic.ValidationError
+            model(**kwargs)
+        assert error_fragment in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "kwargs,error_fragment",
+        [
+            ({"repo_path": "/tmp"}, "include_paths"),
+            (
+                {"repo_path": "/tmp", "include_paths": ["src/"], "exclude_paths": ["tests/"]},
+                "Cannot use",
+            ),
+        ],
+    )
+    def test_filter_paths_requires_one_mode(
+        self, kwargs: dict, error_fragment: str,
+    ) -> None:
+        with pytest.raises(Exception) as excinfo:  # pydantic.ValidationError
+            FilterPathsInput(**kwargs)
+        assert error_fragment in str(excinfo.value)
+
+    def test_rewrite_single_commit_requires_hex_hash(self) -> None:
+        with pytest.raises(Exception) as excinfo:  # pydantic.ValidationError
+            RewriteSingleCommitInput(repo_path="/tmp", commit_hash='"; evil')
+        assert "commit_hash" in str(excinfo.value)
+
+    def test_rewrite_single_commit_rejects_overly_short_hash(self) -> None:
+        with pytest.raises(Exception) as excinfo:  # pydantic.ValidationError
+            RewriteSingleCommitInput(repo_path="/tmp", commit_hash="abc")
+        assert "commit_hash" in str(excinfo.value)
+
+    def test_rewrite_single_commit_rejects_partial_author(self) -> None:
+        with pytest.raises(Exception) as excinfo:  # pydantic.ValidationError
+            RewriteSingleCommitInput(
+                repo_path="/tmp", commit_hash="abc123", new_author_name="Only Name",
+            )
+        assert "new_author_email" in str(excinfo.value)
+
+    def test_unknown_fields_rejected(self) -> None:
+        with pytest.raises(Exception) as excinfo:  # pydantic.ValidationError
+            AnalyzeHistoryInput(repo_path="/tmp", unexpected=True)
+        assert "unexpected" in str(excinfo.value)
+
 
 # =========================================================================
 # Protocol layer — list_tools, call_tool, _execute_tool dispatch
@@ -166,7 +266,8 @@ class TestListTools:
         # Spot-check critical ones — full set is asserted by test_tools.py.
         assert {
             "analyze_git_history", "rewrite_commit_messages",
-            "change_author", "create_backup",
+            "change_author", "create_backup", "validate_repo_safety",
+            "find_large_files", "list_backups", "resolve_commit",
         } <= names
         for tool in tools:
             assert tool.name and tool.description and tool.inputSchema is not None
@@ -198,6 +299,12 @@ class TestExecuteToolDispatch:
         result = await _execute_tool("unknown_tool", {})
         assert result["error_code"] == ErrorCode.TOOL_NOT_FOUND
         assert "Unknown tool" in result["error"]
+
+    async def test_non_object_arguments_rejected(self) -> None:
+        result = await _execute_tool("analyze_git_history", ["not", "an", "object"])  # type: ignore[arg-type]
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+        assert "JSON object" in result["error"]
 
     @pytest.mark.parametrize(
         "tool,args,error_fragment",
@@ -235,6 +342,77 @@ class TestAnalyzeHistoryHandler:
         assert result["success"] is True
         assert result["total_commits"] == 10
         patched_adapter.analyze_history.assert_called_once_with("main", 50)
+
+
+class TestValidateRepoSafetyHandler:
+    async def test_passes_through(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.validate_repo_safety.return_value = {
+            "is_clean": True,
+            "safe_for_rewrite": True,
+            "warnings": [],
+        }
+        result = await _execute_tool("validate_repo_safety", {"repo_path": "/tmp/repo"})
+        assert result["success"] is True
+        assert result["safe_for_rewrite"] is True
+        patched_adapter.validate_repo_safety.assert_called_once_with()
+
+
+class TestFindLargeFilesHandler:
+    async def test_forwards_threshold_and_limit(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.find_large_files.return_value = {
+            "large_files": [{"path": "big.bin", "size_mb": 12.5}],
+            "total_large_files": 1,
+            "truncated": False,
+        }
+        result = await _execute_tool("find_large_files", {
+            "repo_path": "/tmp/repo",
+            "size_threshold_mb": 5.0,
+            "limit": 25,
+        })
+        assert result["success"] is True
+        assert result["total_large_files"] == 1
+        patched_adapter.find_large_files.assert_called_once_with(5.0, 25)
+
+
+class TestListBackupsHandler:
+    async def test_forwards_limit(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.list_backups.return_value = {
+            "backups": ["backup_20241209_123456_000000"],
+            "total_backups": 1,
+            "truncated": False,
+        }
+        result = await _execute_tool("list_backups", {
+            "repo_path": "/tmp/repo",
+            "limit": 10,
+        })
+        assert result["success"] is True
+        assert result["backups"] == ["backup_20241209_123456_000000"]
+        patched_adapter.list_backups.assert_called_once_with(10)
+
+
+class TestResolveCommitHandler:
+    async def test_returns_commit(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.resolve_commit_ref.return_value = {
+            "hash": "a" * 40,
+            "hash_short": "aaaaaaaa",
+            "message": "Test commit",
+        }
+        result = await _execute_tool("resolve_commit", {
+            "repo_path": "/tmp/repo",
+            "commit_ref": "HEAD",
+        })
+        assert result["success"] is True
+        assert result["commit"]["hash_short"] == "aaaaaaaa"
+        patched_adapter.resolve_commit_ref.assert_called_once_with("HEAD")
+
+    async def test_not_found(self, patched_adapter: MagicMock) -> None:
+        patched_adapter.resolve_commit_ref.return_value = None
+        result = await _execute_tool("resolve_commit", {
+            "repo_path": "/tmp/repo",
+            "commit_ref": "deadbeef",
+        })
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
 
 
 class TestGetCommitDetailsHandler:
@@ -317,17 +495,17 @@ class TestGetFileHistoryHandler:
 
 class TestBackupHandlers:
     async def test_create_backup(self, patched_adapter: MagicMock) -> None:
-        patched_adapter.create_backup.return_value = "backup-20241209-123456"
+        patched_adapter.create_backup.return_value = "backup_20241209_123456_000000"
         result = await _execute_tool("create_backup", {"repo_path": "/tmp/repo"})
-        assert result["backup_branch"] == "backup-20241209-123456"
+        assert result["backup_branch"] == "backup_20241209_123456_000000"
 
     async def test_restore_backup(self, patched_adapter: MagicMock) -> None:
         patched_adapter.restore_backup.return_value = make_fr(message="Restored")
         result = await _execute_tool("restore_backup", {
-            "repo_path": "/tmp/repo", "backup_branch": "backup-20241209-123456",
+            "repo_path": "/tmp/repo", "backup_branch": "backup_20241209_123456_000000",
         })
         assert result["success"] is True
-        patched_adapter.restore_backup.assert_called_once_with("backup-20241209-123456")
+        patched_adapter.restore_backup.assert_called_once_with("backup_20241209_123456_000000")
 
 
 # =========================================================================
@@ -610,7 +788,7 @@ class TestRewriteSingleCommit:
         patched_adapter.get_commits.return_value = []
         patched_adapter._validate_commit_hash = MagicMock()
         result = await _execute_tool("rewrite_single_commit", {
-            "repo_path": "/tmp/repo", "commit_hash": "nonexistent",
+            "repo_path": "/tmp/repo", "commit_hash": "deadbeef",
             "new_message": "New message",
         })
         assert result["success"] is False
@@ -685,6 +863,42 @@ class TestRewriteSingleCommit:
 class TestAutoBackup:
     """Auto-backup must run before destructive ops, and never on dry_run."""
 
+    async def test_config_default_dry_run_applied_when_omitted(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        with patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.default_dry_run = False
+            mock_config.return_value.server.auto_backup = False
+            patched_adapter.change_author.return_value = make_fr(dry_run=False)
+            await _execute_tool("change_author", {
+                "repo_path": "/tmp/repo",
+                "old_email": "a@b",
+                "new_name": "N",
+                "new_email": "n@b",
+            })
+        patched_adapter.change_author.assert_called_once_with(
+            "a@b", "N", "n@b", False, True,
+        )
+
+    async def test_explicit_dry_run_overrides_config_default(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        with patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.server.default_dry_run = False
+            mock_config.return_value.server.auto_backup = True
+            patched_adapter.change_author.return_value = make_fr(dry_run=True)
+            await _execute_tool("change_author", {
+                "repo_path": "/tmp/repo",
+                "old_email": "a@b",
+                "new_name": "N",
+                "new_email": "n@b",
+                "dry_run": True,
+            })
+        patched_adapter.change_author.assert_called_once_with(
+            "a@b", "N", "n@b", True, False,
+        )
+        patched_adapter.create_backup.assert_not_called()
+
     async def test_backup_runs_before_destructive_op(
         self, patched_adapter: MagicMock,
     ) -> None:
@@ -738,6 +952,19 @@ class TestAIProviderPlumbing:
                 base_url="https://custom.api.com/v1",
             )
 
+    def test_openai_uses_provider_default_when_config_model_is_ollama_default(self) -> None:
+        from git_filter_repo_mcp.server import _create_ai_provider
+        with patch("git_filter_repo_mcp.server.get_config") as mock_gc, \
+             patch("git_filter_repo_mcp.server.get_provider") as mock_gp:
+            mock_gc.return_value.ai.model = "llama3.2"
+            mock_gc.return_value.ai.openai_api_key = "sk-test"
+            mock_gc.return_value.ai.openai_base_url = "https://api.openai.com/v1"
+            _create_ai_provider({}, "openai")
+            mock_gp.assert_called_once_with(
+                "openai", model="gpt-4o-mini", api_key="sk-test",
+                base_url="https://api.openai.com/v1",
+            )
+
     def test_rejects_none_provider(self) -> None:
         from git_filter_repo_mcp.server import _create_ai_provider
         with pytest.raises(ValueError, match="Invalid AI provider"):
@@ -780,6 +1007,59 @@ class TestAIProviderPlumbing:
             })
         assert result["success"] is False
         assert "none" in result["error"].lower()
+
+    async def test_missing_openai_key_returns_invalid_input(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        patched_adapter.get_commits.return_value = [make_ci("abc123")]
+        patched_adapter.collect_commit_files.return_value = {"abc123": []}
+        with patch("git_filter_repo_mcp.server.get_config") as mock_config:
+            mock_config.return_value.ai.provider = "openai"
+            mock_config.return_value.ai.model = "gpt-4o-mini"
+            mock_config.return_value.ai.openai_api_key = None
+            mock_config.return_value.ai.openai_base_url = "https://api.openai.com/v1"
+            result = await _execute_tool("rewrite_commit_messages", {
+                "repo_path": "/tmp/repo", "use_ai": True, "dry_run": True,
+            })
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+        assert result["ai_provider"] == "openai"
+
+    async def test_all_ai_generation_failures_return_ai_error(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        mock_commits = [make_ci("aaa111", "msg1"), make_ci("bbb222", "msg2")]
+        patched_adapter.get_commits.return_value = mock_commits
+        patched_adapter.collect_commit_files.return_value = {
+            "aaa111": ["file1.py"], "bbb222": ["file2.py"],
+        }
+
+        mock_engine = MagicMock()
+        mock_engine.rewrite_batch = AsyncMock(return_value=[
+            MagicMock(
+                original="msg1", rewritten="msg1", commit_hash="aaa111",
+                reasoning="AI call failed: boom",
+            ),
+            MagicMock(
+                original="msg2", rewritten="msg2", commit_hash="bbb222",
+                reasoning="AI call failed: boom",
+            ),
+        ])
+        mock_engine.close = AsyncMock()
+
+        with patch("git_filter_repo_mcp.server._create_ai_provider") as mock_create, \
+             patch("git_filter_repo_mcp.server._check_ai_connection",
+                   new_callable=AsyncMock, return_value=None), \
+             patch("git_filter_repo_mcp.server.AICommitEngine", return_value=mock_engine):
+            mock_create.return_value = MagicMock(close=AsyncMock())
+            result = await _execute_tool("rewrite_commit_messages", {
+                "repo_path": "/tmp/repo", "use_ai": True,
+                "ai_provider": "ollama", "dry_run": True,
+            })
+
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.AI_CONNECTION_FAILED
+        assert result["ai_failures"] == 2
 
 
 class TestErrorEnvelope:

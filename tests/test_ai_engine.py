@@ -341,6 +341,17 @@ class TestProviderHTTP:
         assert "not found" in status
 
     @pytest.mark.asyncio
+    async def test_ollama_check_connection_malformed_response(self) -> None:
+        provider = OllamaProvider(model="llama3.2")
+        provider.client = AsyncMock()
+        response = _make_response()
+        response.json.side_effect = ValueError("bad json")
+        provider.client.get.return_value = response
+        connected, status = await provider.check_connection()
+        assert connected is False
+        assert "Malformed response" in status
+
+    @pytest.mark.asyncio
     async def test_openai_check_connection_unauthorized(self) -> None:
         provider = OpenAIProvider(api_key="bad-key")
         provider.client = AsyncMock()
@@ -487,6 +498,19 @@ class TestRewriteBatch:
         assert rewrites["ok1"] == "new: msg1"
         assert rewrites["ok2"] == "new: msg3"
         assert rewrites["bad"] == "msg2"  # original preserved
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_propagates(self) -> None:
+        async def cancelled_rewrite(message: str, commit_hash: str, files: list[str]) -> RewriteResult:
+            if commit_hash == "cancel":
+                raise asyncio.CancelledError()
+            return RewriteResult(original=message, rewritten=message, commit_hash=commit_hash)
+
+        engine = AICommitEngine()
+        engine.rewrite_message = cancelled_rewrite  # type: ignore[assignment]
+
+        with pytest.raises(asyncio.CancelledError):
+            await engine.rewrite_batch([("cancel", "msg", [])])
 
     @pytest.mark.asyncio
     async def test_concurrency_limit_respected(self) -> None:

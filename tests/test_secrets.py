@@ -18,8 +18,12 @@ class TestScanContent:
     # introduced in ``secrets.py``.
     DETECTIONS = [
         ("aws_access_key", "AWS_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE"),
-        ("github_token", "token = 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'"),
+        ("aws_access_key", "AWS_ACCESS_KEY_ID=ASIAIOSFODNN7EXAMPLE"),
+        ("aws_secret_key", "AWS_SECRET_ACCESS_KEY=" + "a" * 40),
+        ("github_oauth", "token = 'gho_" + "x" * 36 + "'"),
+        ("github_token", "token = 'ghp_" + "x" * 36 + "'"),
         ("openai_api_key", "OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+        ("openai_api_key", 'OPENAI_API_KEY="sk-proj-' + "x" * 48 + '"'),
         ("private_key", "-----BEGIN RSA PRIVATE KEY-----\nxxx\n-----END RSA PRIVATE KEY-----"),
         (
             "jwt_token",
@@ -28,6 +32,19 @@ class TestScanContent:
             "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
         ),
         ("anthropic_api_key", "API_KEY=sk-ant-api03-" + "x" * 50),
+        ("slack_token", "SLACK_TOKEN=xoxb-1234567890-123456789012-" + "a" * 24),
+        (
+            "slack_webhook",
+            "https://hooks.slack.com/services/T12345678/B12345678/" + "a" * 24,
+        ),
+        ("stripe_key", "STRIPE_SECRET=sk_live_" + "a" * 24),
+        ("stripe_test_key", "STRIPE_SECRET=sk_test_" + "a" * 24),
+        ("google_api_key", "GOOGLE_API_KEY=AIza" + "a" * 35),
+        ("firebase_key", "FIREBASE_KEY=AAAA" + "a" * 7 + ":" + "b" * 140),
+        ("basic_auth", "https://user:password@example.com/path"),
+        ("password_in_url", "https://example.com/reset?password=secret123"),
+        ("generic_secret", 'api_key = "abcdefghijklmnop"'),
+        ("env_secret", "APP_TOKEN=abc123"),
     ]
 
     @pytest.mark.parametrize("pattern_name,content", DETECTIONS, ids=[p for p, _ in DETECTIONS])
@@ -43,6 +60,30 @@ class TestScanContent:
         content = "API_KEY=sk-ant-api03-" + "x" * 50
         findings = scan_content(content, "config.py", "abc123")
         assert not any(f.pattern_name == "openai_api_key" for f in findings)
+
+    def test_openai_project_key_not_downgraded_to_env_secret(self) -> None:
+        content = 'OPENAI_API_KEY="sk-proj-' + "x" * 48 + '"'
+        findings = scan_content(content, "config.py", "abc123")
+        assert any(f.pattern_name == "openai_api_key" and f.severity == "high" for f in findings)
+        assert not any(f.pattern_name == "env_secret" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content,expected",
+        [
+            ("AWS_ACCESS_KEY_ID=ASIAIOSFODNN7EXAMPLE", "aws_access_key"),
+            ("AWS_SECRET_ACCESS_KEY=" + "a" * 40, "aws_secret_key"),
+        ],
+    )
+    def test_aws_specific_patterns_not_downgraded_to_env_secret(
+        self, content: str, expected: str,
+    ) -> None:
+        findings = scan_content(content, "config.py", "abc123")
+        assert any(f.pattern_name == expected and f.severity == "high" for f in findings)
+        assert not any(f.pattern_name == "env_secret" for f in findings)
+
+    def test_github_oauth_uses_specific_pattern(self) -> None:
+        findings = scan_content("token='gho_" + "x" * 36 + "'", "config.py", "abc123")
+        assert [f.pattern_name for f in findings] == ["github_oauth"]
 
     def test_no_false_positive_on_clean_code(self) -> None:
         content = 'def hello():\n    print("Hello, World!")\n    return 42\n'
@@ -64,9 +105,11 @@ class TestSensitiveFiles:
     @pytest.mark.parametrize(
         "path",
         [".env", ".env.local", ".env.production", "credentials.json",
-         "secrets.json", "id_rsa", "server.key", "cert.pem",
+         "secrets.json", "id_rsa", "server.key", "cert.pem", ".ENV",
+         "SERVER.KEY", "CERT.PEM",
          # Regression: Windows-style separator must not block matching.
-         "src\\firebase-adminsdk-abc.json", "configs\\.env"],
+         "src\\firebase-adminsdk-abc.json", "configs\\.env",
+         "src\\FIREBASE-ADMINSdk-abc.JSON"],
     )
     def test_sensitive(self, path: str) -> None:
         assert is_sensitive_file(path) is True
@@ -85,9 +128,11 @@ class TestRiskLevel:
             (".env", "high"),
             ("id_rsa", "high"),
             ("server.pem", "high"),
+            ("SERVER.PEM", "high"),
             # config.json itself is in SENSITIVE_FILES (high); use another
             # .json/.yml to exercise the medium branch.
             ("app_settings.json", "medium"),
+            ("APP_SETTINGS.JSON", "medium"),
             ("data.yml", "medium"),
             ("main.py", "low"),
             ("index.js", "low"),

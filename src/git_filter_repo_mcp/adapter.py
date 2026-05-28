@@ -32,6 +32,9 @@ MAX_FILES_TO_SCAN = 200
 # Date randomization: probability of advancing to the next day between commits
 DATE_ADVANCE_PROBABILITY = 0.3
 
+_BACKUP_BRANCH_RE = re.compile(r"^backup_\d{8}_\d{6}_\d{6}$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00\n\r\t]")
+
 
 def _parse_lines(output: str) -> list[str]:
     """Parse stdout into non-empty lines."""
@@ -54,7 +57,7 @@ def _temp_file(content: str, suffix: str) -> Iterator[str]:
     subprocesses (required on Windows where the open handle would block
     other readers).
     """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False, encoding="utf-8") as f:
         f.write(content)
         path = f.name
     try:
@@ -84,7 +87,7 @@ _REWRITE_SINGLE_BODY = """\
 _TARGET = _PAYLOAD["target"]
 _CHANGES = _PAYLOAD["changes"]
 _orig_id = commit.original_id.decode() if commit.original_id else None
-if _orig_id and (_orig_id.startswith(_TARGET) or _TARGET.startswith(_orig_id)):
+if _orig_id == _TARGET:
     if "message" in _CHANGES:
         commit.message = _CHANGES["message"].encode()
     if "author_name" in _CHANGES:
@@ -337,6 +340,98 @@ class GitFilterRepoAdapter:
             ],
         }
 
+    def validate_repo_safety(self) -> dict:
+        """Return read-only safety checks for destructive history rewrites."""
+        warnings = []
+        current_branch = self._run_git_fast("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        is_detached = current_branch == "HEAD"
+        if is_detached:
+            warnings.append("HEAD is detached")
+
+        try:
+            head = self._run_git_fast("rev-parse", "HEAD").stdout.strip()
+        except subprocess.CalledProcessError:
+            head = None
+            warnings.append("Repository has no commits")
+
+        status = self._run_git_fast("status", "--porcelain").stdout
+        dirty_entries = _parse_lines(status)
+        is_clean = not dirty_entries
+        if not is_clean:
+            warnings.append("Working tree has uncommitted changes")
+
+        upstream = None
+        ahead = behind = None
+        try:
+            upstream = self._run_git_fast(
+                "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}",
+            ).stdout.strip()
+            counts = self._run_git_fast("rev-list", "--left-right", "--count", "@{u}...HEAD")
+            parts = counts.stdout.split()
+            if len(parts) >= 2:
+                behind = _safe_int(parts[0])
+                ahead = _safe_int(parts[1])
+        except subprocess.CalledProcessError:
+            warnings.append("No upstream branch configured")
+
+        backups = self.list_backups(limit=1)
+        return {
+            "repo_path": str(self.repo_path),
+            "current_branch": current_branch,
+            "head": head,
+            "is_detached": is_detached,
+            "is_clean": is_clean,
+            "dirty_entries": dirty_entries[:20],
+            "dirty_count": len(dirty_entries),
+            "upstream": upstream,
+            "ahead": ahead,
+            "behind": behind,
+            "backup_count": backups["total_backups"],
+            "git_filter_repo_available": bool(shutil.which("git-filter-repo")),
+            "safe_for_rewrite": is_clean and head is not None,
+            "warnings": warnings,
+        }
+
+    def list_backups(self, limit: int = 100) -> dict:
+        """List backup branches created by this tool."""
+        result = self._run_git("branch", "--list", "backup_*", "--format=%(refname:short)")
+        branches = [
+            branch
+            for branch in _parse_lines(result.stdout)
+            if _BACKUP_BRANCH_RE.fullmatch(branch)
+        ]
+        branches.sort(reverse=True)
+        return {
+            "backups": branches[:limit],
+            "total_backups": len(branches),
+            "returned": min(len(branches), limit),
+            "truncated": len(branches) > limit,
+            "limit": limit,
+        }
+
+    def resolve_commit_ref(self, commit_ref: str) -> dict | None:
+        """Resolve a commit-ish ref to a full commit preview."""
+        self._validate_ref(commit_ref)
+        try:
+            resolved = self._run_git_fast(
+                "rev-parse", "--verify", f"{commit_ref}^{{commit}}",
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+
+        commits = self.get_commits(resolved, max_count=1)
+        if not commits:
+            return None
+        commit = commits[0]
+        return {
+            "input": commit_ref,
+            "hash": commit.hash,
+            "hash_short": commit.hash[:8],
+            "author": f"{commit.author_name} <{commit.author_email}>",
+            "message": commit.message,
+            "date": commit.date,
+        }
+
     def rewrite_commit_messages(
         self,
         message_callback: Callable[[str, str], str],
@@ -368,6 +463,14 @@ class GitFilterRepoAdapter:
                 commits_processed=len(commits),
                 commits_rewritten=len(rewrites),
                 dry_run=True,
+            )
+
+        if not rewrites:
+            return FilterResult(
+                success=True,
+                message="No commit messages needed rewriting",
+                commits_processed=len(commits),
+                commits_rewritten=0,
             )
 
         # Build both message-based and hash-based lookup tables.
@@ -415,16 +518,8 @@ class GitFilterRepoAdapter:
         returns success with a message listing existing author emails.
         """
         for label, value in [("name", new_name), ("email", new_email), ("old_email", old_email)]:
-            if not value or not value.strip():
-                return FilterResult(
-                    success=False,
-                    message=f"{label} must not be empty",
-                )
-            if any(c in value for c in "<>\n\r\t"):
-                return FilterResult(
-                    success=False,
-                    message=f"Invalid characters in {label}: angle brackets, tabs, and newlines are not allowed",
-                )
+            if error := self._validate_identity_value(label, value):
+                return error
 
         commits = self.get_commits()
         affected = [c for c in commits if c.author_email == old_email]
@@ -502,18 +597,12 @@ class GitFilterRepoAdapter:
 
         return FilterResult(success=True, message=f"Removed {len(paths)} paths", files_affected=paths)
 
-    def remove_large_files(
-        self, size_threshold_mb: float = 10.0, dry_run: bool = True, force: bool = False,
-    ) -> FilterResult:
-        """Find and remove files larger than size_threshold_mb from history.
-
-        Uses git cat-file --batch-check for efficient bulk size queries,
-        with per-object fallback if batch mode fails.
-        """
+    def _large_files_over_threshold(self, size_threshold_mb: float) -> list[tuple[str, float]]:
+        """Return (path, size_mb) entries above a history blob size threshold."""
         try:
             result = self._run_git("rev-list", "--objects", "--all")
         except subprocess.CalledProcessError:
-            return FilterResult(success=True, message="No objects found (empty repository?)", dry_run=dry_run)
+            return []
         size_bytes = int(size_threshold_mb * 1024 * 1024)
 
         objects_with_paths = {}
@@ -525,9 +614,9 @@ class GitFilterRepoAdapter:
                 object_hashes.append(parts[0])
 
         if not object_hashes:
-            return FilterResult(success=True, message="No files found", files_affected=[], dry_run=dry_run)
+            return []
 
-        large_files = []
+        large_files: list[tuple[str, float]] = []
         try:
             batch_result = subprocess.run(
                 ["git", "cat-file", "--batch-check=%(objectsize)"],
@@ -549,6 +638,35 @@ class GitFilterRepoAdapter:
                         large_files.append((objects_with_paths.get(blob_hash, blob_hash), size / (1024 * 1024)))
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                     continue
+
+        return sorted(large_files, key=lambda item: item[1], reverse=True)
+
+    def find_large_files(self, size_threshold_mb: float = 10.0, limit: int = 100) -> dict:
+        """Find large files in history without modifying the repository."""
+        large_files = self._large_files_over_threshold(size_threshold_mb)
+        returned = large_files[:limit]
+        return {
+            "message": f"Found {len(large_files)} large file(s)",
+            "threshold_mb": size_threshold_mb,
+            "large_files": [
+                {"path": path, "size_mb": round(size_mb, 4)}
+                for path, size_mb in returned
+            ],
+            "total_large_files": len(large_files),
+            "returned": len(returned),
+            "truncated": len(large_files) > limit,
+            "limit": limit,
+        }
+
+    def remove_large_files(
+        self, size_threshold_mb: float = 10.0, dry_run: bool = True, force: bool = False,
+    ) -> FilterResult:
+        """Find and remove files larger than size_threshold_mb from history.
+
+        Uses git cat-file --batch-check for efficient bulk size queries,
+        with per-object fallback if batch mode fails.
+        """
+        large_files = self._large_files_over_threshold(size_threshold_mb)
 
         if dry_run:
             return FilterResult(
@@ -640,7 +758,7 @@ class GitFilterRepoAdapter:
 
     def restore_backup(self, backup_branch: str) -> FilterResult:
         """Restore from a backup branch."""
-        if not backup_branch.startswith("backup_") or not re.match(r'^backup_[0-9_]+$', backup_branch):
+        if not _BACKUP_BRANCH_RE.fullmatch(backup_branch):
             return FilterResult(
                 success=False,
                 message=f"Invalid backup branch: {backup_branch!r}",
@@ -652,6 +770,9 @@ class GitFilterRepoAdapter:
 
             result = self._run_git("rev-parse", "--abbrev-ref", "HEAD")
             current_branch = result.stdout.strip()
+
+            if error := self._require_clean_worktree("restore backup"):
+                return error
 
             self._run_git("reset", "--hard", backup_branch)
 
@@ -674,6 +795,9 @@ class GitFilterRepoAdapter:
         Returns {commit_hash: [file_paths]}. Falls back to per-commit
         get_commit_files (first 20) if the bulk call fails.
         """
+        self._validate_ref(branch)
+        if max_commits < 0:
+            raise ValueError(f"max_commits must be non-negative: {max_commits}")
         try:
             result = self._run_git(
                 "log", "--name-only", "--format=%H", f"-n{max_commits}", branch,
@@ -692,34 +816,38 @@ class GitFilterRepoAdapter:
 
     def _scan_file_contents(
         self, files_to_scan: list[tuple[str, str]],
-    ) -> list[dict]:
+    ) -> tuple[list[dict], bool]:
         """Scan file contents for secrets.
 
         Args:
             files_to_scan: List of (commit_hash, file_path) tuples.
 
         Returns:
-            List of finding dicts with keys: type, description, severity,
-            file, commit, line, matched. Capped at MAX_FINDINGS_LIMIT.
+            (findings, truncated). Findings are capped at MAX_FINDINGS_LIMIT.
         """
         from .secrets import scan_content
 
         findings: list[dict] = []
+        truncated = False
         for commit_hash, file_path in files_to_scan:
             if len(findings) >= MAX_FINDINGS_LIMIT:
+                truncated = True
                 break
             try:
                 content = self._run_git_fast("show", f"{commit_hash}:{file_path}").stdout
                 if not content:
                     continue
                 for f in scan_content(content, file_path, commit_hash):
+                    if len(findings) >= MAX_FINDINGS_LIMIT:
+                        truncated = True
+                        break
                     findings.append({
                         "type": f.pattern_name, "description": f.description, "severity": f.severity,
                         "file": f.file_path, "commit": f.commit_hash[:8], "line": f.line_number, "matched": f.matched_text,
                     })
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 continue
-        return findings
+        return findings, truncated
 
     def scan_secrets(
         self,
@@ -739,8 +867,10 @@ class GitFilterRepoAdapter:
         sensitive_files = []
         seen_sensitive: set[str] = set()
         files_to_scan: list[tuple[str, str]] = []
+        candidate_file_count = 0
         for commit in commits:
             for file_path in commit_files_map.get(commit.hash, []):
+                candidate_file_count += 1
                 if is_sensitive_file(file_path) and file_path not in seen_sensitive:
                     seen_sensitive.add(file_path)
                     sensitive_files.append({
@@ -749,7 +879,7 @@ class GitFilterRepoAdapter:
                 if len(files_to_scan) < MAX_FILES_TO_SCAN:
                     files_to_scan.append((commit.hash, file_path))
 
-        findings = self._scan_file_contents(files_to_scan)
+        findings, findings_truncated = self._scan_file_contents(files_to_scan)
 
         total_findings = len(findings)
         total_sensitive = len(sensitive_files)
@@ -764,7 +894,18 @@ class GitFilterRepoAdapter:
             "message": message,
             "commits_scanned": len(commits), "secrets_found": total_findings,
             "sensitive_files": total_sensitive, "findings": findings[:MAX_FINDINGS_LIMIT],
-            "sensitive_file_list": sensitive_files[:MAX_PREVIEW_COMMITS], "files_scanned": len(files_to_scan),
+            "sensitive_file_list": sensitive_files[:MAX_PREVIEW_COMMITS],
+            "files_scanned": len(files_to_scan),
+            "files_considered": candidate_file_count,
+            "files_truncated": candidate_file_count > len(files_to_scan),
+            "findings_truncated": findings_truncated,
+            "sensitive_files_truncated": total_sensitive > MAX_PREVIEW_COMMITS,
+            "scan_limits": {
+                "max_commits": max_commits,
+                "max_files_to_scan": MAX_FILES_TO_SCAN,
+                "max_findings": MAX_FINDINGS_LIMIT,
+                "max_sensitive_files_returned": MAX_PREVIEW_COMMITS,
+            },
         }
 
     @staticmethod
@@ -775,12 +916,68 @@ class GitFilterRepoAdapter:
                 raise ValueError("Invalid path: empty string")
             if path.startswith("-"):
                 raise ValueError(f"Invalid path (must not start with '-'): {path!r}")
+            if _CONTROL_CHARS_RE.search(path):
+                raise ValueError(f"Invalid path (control characters are not allowed): {path!r}")
 
     @staticmethod
     def _validate_commit_hash(commit_hash: str) -> None:
         """Validate commit hash is safe hex string (prevents code injection in callbacks)."""
-        if not re.match(r'^[0-9a-fA-F]+$', commit_hash):
-            raise ValueError(f"Invalid commit hash (must be hex): {commit_hash!r}")
+        if not re.fullmatch(r"[0-9a-fA-F]{4,64}", commit_hash):
+            raise ValueError(
+                f"Invalid commit hash (must be 4-64 hexadecimal characters): {commit_hash!r}"
+            )
+
+    @staticmethod
+    def _validate_identity_value(label: str, value: str) -> FilterResult | None:
+        """Validate author/mailmap identity fields before writing history."""
+        if not value or not value.strip():
+            return FilterResult(success=False, message=f"{label} must not be empty")
+        if any(c in value for c in "<>") or _CONTROL_CHARS_RE.search(value):
+            return FilterResult(
+                success=False,
+                message=f"Invalid characters in {label}: angle brackets, tabs, and newlines are not allowed",
+            )
+        return None
+
+    def _resolve_commit_hash(self, commit_hash: str) -> str | FilterResult:
+        """Resolve a user-supplied abbreviated hash to one exact commit."""
+        self._validate_commit_hash(commit_hash)
+        try:
+            result = self._run_git("rev-parse", "--verify", f"{commit_hash}^{{commit}}")
+        except subprocess.CalledProcessError as e:
+            return FilterResult(
+                success=False,
+                message=f"Commit not found or ambiguous: {commit_hash}",
+                error=(e.stderr or str(e)),
+            )
+
+        resolved = result.stdout.strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", resolved):
+            return FilterResult(
+                success=False,
+                message=f"Could not resolve commit hash: {commit_hash}",
+                error=f"Unexpected rev-parse output: {resolved!r}",
+            )
+        return resolved
+
+    def _require_clean_worktree(self, operation: str) -> FilterResult | None:
+        """Reject destructive non-filter operations that would mix/drop local changes."""
+        try:
+            result = self._run_git_fast("status", "--porcelain")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            return FilterResult(
+                success=False,
+                message=f"Failed to check working tree before {operation}",
+                error=str(e),
+            )
+        dirty = result.stdout.strip()
+        if dirty:
+            return FilterResult(
+                success=False,
+                message=f"Working tree must be clean before {operation}",
+                error=dirty,
+            )
+        return None
 
     def rewrite_single_commit(
         self,
@@ -789,26 +986,50 @@ class GitFilterRepoAdapter:
         new_author_name: str | None = None,
         new_author_email: str | None = None,
         force: bool = True,
+        dry_run: bool = False,
     ) -> FilterResult:
         """Rewrite a single commit's message and/or author in one filter-repo pass.
 
         Note: When author fields are changed, committer fields are also updated
         to match, since in most workflows they should be identical.
         """
-        self._validate_commit_hash(commit_hash)
         changes = {}
+        if new_message is not None and "\x00" in new_message:
+            return FilterResult(success=False, message="new_message must not contain NUL bytes")
         if new_message is not None:
             changes["message"] = new_message
         if new_author_name is not None:
+            if error := self._validate_identity_value("author_name", new_author_name):
+                return error
             changes["author_name"] = new_author_name
         if new_author_email is not None:
+            if error := self._validate_identity_value("author_email", new_author_email):
+                return error
             changes["author_email"] = new_author_email
 
         if not changes:
             return FilterResult(success=False, message="No changes specified")
 
+        resolved_hash = self._resolve_commit_hash(commit_hash)
+        if isinstance(resolved_hash, FilterResult):
+            return resolved_hash
+
+        if dry_run:
+            changes_made = []
+            if new_message is not None:
+                changes_made.append("message")
+            if new_author_name is not None or new_author_email is not None:
+                changes_made.append("author")
+            return FilterResult(
+                success=True,
+                message=f"Dry run: would update commit {resolved_hash[:8]}: {', '.join(changes_made)}",
+                commits_processed=1,
+                commits_rewritten=1,
+                dry_run=True,
+            )
+
         callback_code = self._build_callback(
-            {"_PAYLOAD": {"target": commit_hash, "changes": changes}},
+            {"_PAYLOAD": {"target": resolved_hash, "changes": changes}},
             _REWRITE_SINGLE_BODY,
         )
 
@@ -833,7 +1054,8 @@ class GitFilterRepoAdapter:
 
         return FilterResult(
             success=True,
-            message=f"Updated commit {commit_hash[:8]}: {', '.join(changes_made)}",
+            message=f"Updated commit {resolved_hash[:8]}: {', '.join(changes_made)}",
+            commits_processed=1,
             commits_rewritten=1,
         )
 
@@ -860,8 +1082,12 @@ class GitFilterRepoAdapter:
     @staticmethod
     def _validate_ref(ref: str) -> None:
         """Validate a git ref is safe (not an option injection)."""
+        if not ref or not ref.strip():
+            raise ValueError("Invalid ref: empty string")
         if ref.startswith("-"):
             raise ValueError(f"Invalid ref (must not start with '-'): {ref!r}")
+        if _CONTROL_CHARS_RE.search(ref):
+            raise ValueError(f"Invalid ref (control characters are not allowed): {ref!r}")
 
     def squash_commits(self, start_commit: str, end_commit: str = "HEAD", new_message: str | None = None, dry_run: bool = True) -> FilterResult:
         """Squash commits between start_commit (exclusive) and end_commit (inclusive).
@@ -879,9 +1105,6 @@ class GitFilterRepoAdapter:
         if commit_count == 0:
             return FilterResult(success=False, message=f"No commits in range: {start_commit}..{end_commit}")
 
-        if dry_run:
-            return FilterResult(success=True, message=f"Dry run: would squash {commit_count} commits", commits_processed=commit_count, dry_run=True)
-
         # Ensure end_commit points to HEAD to avoid silent data loss
         try:
             head_hash = self._run_git("rev-parse", "HEAD").stdout.strip()
@@ -896,6 +1119,12 @@ class GitFilterRepoAdapter:
                 "Squashing a range that does not end at HEAD is not supported.",
             )
 
+        if dry_run:
+            return FilterResult(success=True, message=f"Dry run: would squash {commit_count} commits", commits_processed=commit_count, dry_run=True)
+
+        if error := self._require_clean_worktree("squash commits"):
+            return error
+
         try:
             if new_message is None:
                 messages = _parse_lines(self._run_git("log", "--format=%s", f"{start_commit}..{end_commit}").stdout)
@@ -906,8 +1135,8 @@ class GitFilterRepoAdapter:
                 self._run_git("commit", "-m", new_message)
             except subprocess.CalledProcessError:
                 # Commit failed after reset — restore HEAD to avoid leaving dirty state
-                self._run_git("reset", "--soft", head_hash)
-                return FilterResult(success=False, message="Failed to create squash commit; HEAD restored", error="git commit failed after reset --soft")
+                self._run_git("reset", "--hard", head_hash)
+                return FilterResult(success=False, message="Failed to create squash commit; HEAD restored", error="git commit failed after squash reset")
             return FilterResult(success=True, message=f"Squashed {commit_count} commits", commits_processed=commit_count, commits_rewritten=1)
         except subprocess.CalledProcessError as e:
             return FilterResult(success=False, message="Failed to squash", error=str(e))
@@ -976,6 +1205,12 @@ class GitFilterRepoAdapter:
                         success=False,
                         message=f"Time values out of range: {time_range}",
                         error="Hours must be 0-23, minutes must be 0-59",
+                    )
+                if start_hour == end_hour and start_min > end_min:
+                    return FilterResult(
+                        success=False,
+                        message=f"Invalid time range format: {time_range}",
+                        error="End minute must be greater than or equal to start minute when hours match",
                     )
                 return (start_hour, start_min, end_hour, end_min)
             except (ValueError, IndexError):
@@ -1110,21 +1345,43 @@ class GitFilterRepoAdapter:
                 found_valid = True
                 break
 
-            if preserve_order and prev_timestamp and new_dt <= prev_timestamp:
-                new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 60))
-                if weekend_only and new_dt.weekday() < 5:
-                    new_dt += datetime.timedelta(days=5 - new_dt.weekday())
-                new_dt = new_dt.replace(hour=hour, minute=minute, second=second)
-                if new_dt <= prev_timestamp:
-                    new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(1, 10))
+            if not found_valid:
+                return FilterResult(
+                    success=False,
+                    message="Could not generate dates within the requested constraints",
+                    error="No valid timestamp found after 100 attempts",
+                )
 
-            if not found_valid and prev_timestamp:
-                new_dt = prev_timestamp + datetime.timedelta(minutes=random.randint(5, 30))
-                # The 100-attempt loop exhausted without finding a valid weekend
-                # slot — push forward to the next Saturday rather than silently
-                # writing a weekday timestamp.
-                if weekend_only and new_dt.weekday() < 5:
-                    new_dt += datetime.timedelta(days=5 - new_dt.weekday())
+            if preserve_order and prev_timestamp and new_dt <= prev_timestamp:
+                current_date = (prev_timestamp + datetime.timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0,
+                )
+                found_ordered = False
+                for _ in range(100):
+                    if weekend_only and current_date.weekday() < 5:
+                        current_date += datetime.timedelta(days=5 - current_date.weekday())
+
+                    hour, minute, second = self._pick_random_time(
+                        start_hour, start_min, end_hour, end_min,
+                    )
+                    new_dt = self._compose_datetime(
+                        current_date, hour, minute, second, start_hour, end_hour,
+                    )
+
+                    if weekend_only and new_dt.weekday() < 5:
+                        current_date += datetime.timedelta(days=1)
+                        continue
+                    if new_dt > prev_timestamp:
+                        found_ordered = True
+                        break
+                    current_date += datetime.timedelta(days=1)
+
+                if not found_ordered:
+                    return FilterResult(
+                        success=False,
+                        message="Could not generate ordered dates within the requested constraints",
+                        error="No ordered timestamp found after 100 attempts",
+                    )
 
             # Track ``new_dt`` so subsequent commits advance forward in time
             # (used to live inside the preserve_order branch, which meant

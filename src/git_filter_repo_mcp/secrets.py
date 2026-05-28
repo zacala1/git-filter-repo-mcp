@@ -20,33 +20,34 @@ class SecretPattern:
 SECRET_PATTERNS: list[SecretPattern] = [
     SecretPattern(
         name="aws_access_key",
-        pattern=re.compile(r"AKIA[0-9A-Z]{16}"),
+        pattern=re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
         description="AWS Access Key ID",
         severity="high",
     ),
     SecretPattern(
         name="aws_secret_key",
         pattern=re.compile(
-            r"(?i)(aws_secret|secret_key|secret_access)['\"]?\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?"
+            r"(?i)(aws_secret_access_key|aws_secret|secret_access_key|secret_access|secret_key)"
+            r"['\"]?\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?"
         ),
         description="AWS Secret Key",
         severity="high",
     ),
     SecretPattern(
-        name="github_token",
-        pattern=re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,}"),
-        description="GitHub Token",
-        severity="high",
-    ),
-    SecretPattern(
         name="github_oauth",
-        pattern=re.compile(r"gho_[A-Za-z0-9]{36}"),
+        pattern=re.compile(r"gho_[A-Za-z0-9]{36,}"),
         description="GitHub OAuth Token",
         severity="high",
     ),
     SecretPattern(
+        name="github_token",
+        pattern=re.compile(r"gh[pusr]_[A-Za-z0-9_]{36,}"),
+        description="GitHub Token",
+        severity="high",
+    ),
+    SecretPattern(
         name="openai_api_key",
-        pattern=re.compile(r"sk-(?!ant-)[A-Za-z0-9]{48,}"),
+        pattern=re.compile(r"sk-(?!ant-)[A-Za-z0-9_-]{32,}"),
         description="OpenAI API Key",
         severity="high",
     ),
@@ -190,7 +191,7 @@ def redact_secret(text: str) -> str:
 
     # Longer secrets: show type hint (first 2-4 chars) + hash
     # Only show prefix if it's a known safe prefix pattern
-    safe_prefixes = ["sk-", "ghp", "gho", "AKIA", "xox", "eyJ"]
+    safe_prefixes = ["sk-", "ghp", "gho", "ghu", "ghs", "ghr", "AKIA", "ASIA", "xox", "eyJ"]
     prefix = ""
     for safe in safe_prefixes:
         if text.startswith(safe):
@@ -255,12 +256,14 @@ def is_sensitive_file(file_path: str) -> bool:
     POSIX and Windows paths.
     """
     normalised = file_path.replace("\\", "/")
-    name = Path(normalised).name
+    normalised_lower = normalised.lower()
+    name_lower = Path(normalised).name.lower()
 
     for pattern in SENSITIVE_FILES:
-        if fnmatch.fnmatch(name, pattern):
+        pattern_lower = pattern.lower()
+        if fnmatch.fnmatchcase(name_lower, pattern_lower):
             return True
-        if fnmatch.fnmatch(normalised, pattern):
+        if fnmatch.fnmatchcase(normalised_lower, pattern_lower):
             return True
 
     return False
@@ -275,7 +278,7 @@ def get_file_risk_level(file_path: str) -> str:
     if is_sensitive_file(file_path):
         return "high"
 
-    ext = Path(file_path).suffix
+    ext = Path(file_path).suffix.lower()
     if ext in _HIGH_RISK_EXTENSIONS:
         return "high"
     if ext in _MEDIUM_RISK_EXTENSIONS:

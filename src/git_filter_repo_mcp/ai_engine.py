@@ -55,6 +55,7 @@ class AIProvider(Protocol):
     """AI provider interface."""
 
     async def generate_message(self, context: CommitContext, style: MessageStyle) -> str: ...
+    async def check_connection(self) -> tuple[bool, str]: ...
     async def close(self) -> None: ...
 
 
@@ -256,6 +257,8 @@ class OllamaProvider(BaseProvider):
             return False, f"Cannot connect to Ollama at {self.base_url}"
         except httpx.HTTPError as e:
             return False, f"Ollama: {e}"
+        except (ValueError, KeyError, TypeError) as e:
+            return False, f"Malformed response from Ollama: {e}"
 
     async def _call_api(self, prompt: str) -> str:
         response = await self.client.post(
@@ -464,6 +467,8 @@ class AICommitEngine:
 
         results: list[RewriteResult] = []
         for (commit_hash, message, _files), outcome in zip(commits, raw_results):
+            if isinstance(outcome, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise outcome
             if isinstance(outcome, BaseException):
                 logger.warning(
                     "rewrite_batch: keeping original message for %s due to %s",

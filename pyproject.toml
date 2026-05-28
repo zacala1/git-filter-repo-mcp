@@ -52,6 +52,12 @@ git-filter-repo-mcp = "git_filter_repo_mcp.server:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = [
+    "/.Codex",
+    "/AGENTS.md",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/git_filter_repo_mcp"]
 
