@@ -303,6 +303,14 @@ class RewriteCommitMessagesInput(_DestructiveRepoInput):
     manual_mappings: dict[str, str] | None = Field(
         default=None, description="Manual message mappings: {old_message: new_message}"
     )
+    manual_commit_mappings: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Manual commit message mappings keyed by full or abbreviated commit hash: "
+            "{commit_hash: new_message}. Use this to apply an approved AI dry-run preview "
+            "without calling AI again."
+        ),
+    )
 
     @field_validator("branch")
     @classmethod
@@ -313,6 +321,34 @@ class RewriteCommitMessagesInput(_DestructiveRepoInput):
     @classmethod
     def _validate_ai_base_url(cls, value: str | None) -> str | None:
         return _url_value(value, "ai_base_url")
+
+    @field_validator("manual_commit_mappings")
+    @classmethod
+    def _validate_manual_commit_mappings(
+        cls, value: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        if value is None:
+            return None
+        for commit_hash, message in value.items():
+            if not _HEX_COMMIT_RE.fullmatch(commit_hash):
+                raise ValueError(
+                    "manual_commit_mappings keys must be hexadecimal commit hashes"
+                )
+            _non_blank(message, "manual_commit_mappings value")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_rewrite_mode(self) -> "RewriteCommitMessagesInput":
+        modes = [
+            self.use_ai,
+            bool(self.manual_mappings),
+            bool(self.manual_commit_mappings),
+        ]
+        if sum(1 for enabled in modes if enabled) > 1:
+            raise ValueError(
+                "Choose only one rewrite mode: use_ai, manual_mappings, or manual_commit_mappings"
+            )
+        return self
 
 
 class ChangeAuthorInput(_DestructiveRepoInput):
@@ -672,8 +708,8 @@ modifying the repository.""",
         description="""Rewrite commit messages in the repository history.
 
 Can use AI (Ollama/OpenAI/Anthropic/OpenAI-compatible local or third-party
-providers) to automatically generate better commit messages, or accept manual
-mappings for specific messages.
+providers) to automatically generate better commit messages, accept manual
+message mappings, or apply exact hash-based mappings from a reviewed dry run.
 
 Supports multiple styles:
 - conventional: feat:, fix:, docs:, etc.

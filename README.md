@@ -164,6 +164,26 @@ The rewrite tools can override config for a single MCP call:
 }
 ```
 
+### Apply an Approved Preview Without AI
+
+AI dry runs return both `hash` and `hash_short` for each proposed rewrite. After
+reviewing the preview, apply exact messages without calling the AI provider
+again by using `manual_commit_mappings`:
+
+```json
+{
+  "repo_path": "/path/to/repo",
+  "manual_commit_mappings": {
+    "abc123def456": "feat: add provider diagnostics",
+    "789abc12": "docs: explain local llm setup"
+  },
+  "dry_run": false
+}
+```
+
+Keys may be full or abbreviated hexadecimal commit hashes. Abbreviations must
+match exactly one commit on the selected branch.
+
 ## MCP Workflow
 
 Typical local-LLM rewrite flow:
@@ -173,7 +193,7 @@ Typical local-LLM rewrite flow:
 2. "List git-filter-repo MCP AI providers"
 3. "Check the LM Studio AI provider"
 4. "Rewrite commit messages in /path/to/repo using AI, dry run first"
-5. "Apply the rewrite if the preview is correct"
+5. "Apply the approved preview using manual_commit_mappings"
 ```
 
 Useful providers:
@@ -239,6 +259,7 @@ Useful providers:
 | `ai_check_connection` | Check provider before generation |
 | `ai_max_concurrency` | Concurrent AI requests for batch rewrites |
 | `max_commits` | Limit rewrite generation to the newest N commits |
+| `manual_commit_mappings` | Apply exact `{commit_hash: new_message}` mappings without AI |
 | `style` | `conventional`, `gitmoji`, `simple`, or `detailed` |
 
 `rewrite_single_commit` supports the same AI provider overrides except
@@ -282,7 +303,7 @@ Useful providers:
 
 ```bash
 uv sync --all-extras
-uv run pytest tests/ -v       # 542+ tests
+uv run pytest tests/ -v       # 545+ tests
 uv run ruff check src/ tests/ # lint
 uv run pyright src/            # type check
 ```

@@ -301,6 +301,29 @@ async def _check_ai_connection(provider, provider_name: str) -> dict | None:
     return None
 
 
+def _resolve_manual_commit_mappings(
+    adapter: GitFilterRepoAdapter,
+    branch: str,
+    mappings: dict[str, str],
+) -> dict[str, str]:
+    """Resolve exact or abbreviated commit-hash mappings to full hashes."""
+    commits = adapter.get_commits(branch)
+    resolved: dict[str, str] = {}
+    for commit_ref, new_message in mappings.items():
+        commit_ref_lower = commit_ref.lower()
+        matches = [
+            commit.hash.lower()
+            for commit in commits
+            if commit.hash.lower().startswith(commit_ref_lower)
+        ]
+        if not matches:
+            raise ValueError(f"manual_commit_mappings key not found: {commit_ref}")
+        if len(matches) > 1:
+            raise ValueError(f"manual_commit_mappings key is ambiguous: {commit_ref}")
+        resolved[matches[0]] = new_message
+    return resolved
+
+
 # --- Tool Handlers ---
 
 
@@ -426,6 +449,7 @@ async def _handle_check_ai_provider(args: dict) -> dict:
         response["status"] = status
         if not connected:
             response["success"] = False
+            response["error"] = f"AI ({provider_name}) connection failed: {status}"
             response["error_code"] = ErrorCode.AI_CONNECTION_FAILED
         return response
     finally:
@@ -512,7 +536,12 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                     "dry_run": True,
                     "message": f"Would rewrite {len(rewrites)} commits",
                     "commits_to_rewrite": [
-                        {"hash": r["hash_short"], "original": r["original"], "new": r["new"]}
+                        {
+                            "hash": r["hash"],
+                            "hash_short": r["hash_short"],
+                            "original": r["original"],
+                            "new": r["new"],
+                        }
                         for r in rewrites[:20]
                     ],
                     "total_rewrites": len(rewrites),
@@ -560,21 +589,54 @@ async def _handle_rewrite_messages(args: dict) -> dict:
     elif params.manual_mappings:
         mappings = params.manual_mappings
 
-        def callback(msg: str, _: str) -> str:
+        def message_callback(msg: str, _: str) -> str:
             return mappings.get(msg, msg)
 
         backup = _maybe_backup(adapter, dry_run)
         result = await asyncio.to_thread(
             adapter.rewrite_commit_messages,
-            callback, branch=params.branch, dry_run=dry_run, force=not dry_run,
+            message_callback, branch=params.branch, dry_run=dry_run, force=not dry_run,
         )
         response = result_to_dict(result)
         if backup:
             response["backup_branch"] = backup
         return response
 
+    elif params.manual_commit_mappings:
+        try:
+            rewrite_by_hash = await asyncio.to_thread(
+                _resolve_manual_commit_mappings,
+                adapter,
+                params.branch,
+                params.manual_commit_mappings,
+            )
+        except ValueError as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "error_code": ErrorCode.INVALID_INPUT,
+            }
+
+        def commit_callback(msg: str, commit_hash: str) -> str:
+            return rewrite_by_hash.get(commit_hash.lower(), msg)
+
+        backup = _maybe_backup(adapter, dry_run)
+        result = await asyncio.to_thread(
+            adapter.rewrite_commit_messages,
+            commit_callback, branch=params.branch, dry_run=dry_run, force=not dry_run,
+        )
+        response = result_to_dict(result)
+        response["manual_commit_mappings_resolved"] = len(rewrite_by_hash)
+        if backup:
+            response["backup_branch"] = backup
+        return response
+
     else:
-        return {"success": False, "error": "Either use_ai or manual_mappings must be provided", "error_code": ErrorCode.INVALID_INPUT}
+        return {
+            "success": False,
+            "error": "Provide use_ai, manual_mappings, or manual_commit_mappings",
+            "error_code": ErrorCode.INVALID_INPUT,
+        }
 
 
 @tool_handler("change_author")

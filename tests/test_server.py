@@ -18,6 +18,7 @@ collapse the otherwise-verbose ``patch + MagicMock + side_effect`` ritual.
 
 import json
 import subprocess as sp
+from types import SimpleNamespace
 from typing import Any, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -160,6 +161,7 @@ class TestPydanticInputValidation:
         assert params.ai_base_url is None
         assert params.ai_max_concurrency == 5
         assert params.ai_check_connection is True
+        assert params.manual_commit_mappings is None
         assert params.dry_run is True
         assert params.style == "conventional"
 
@@ -194,6 +196,14 @@ class TestPydanticInputValidation:
         )
         assert params.ai_provider == "lmstudio"
         assert params.ai_base_url == "http://localhost:1234/v1"
+
+    def test_manual_commit_mapping_keys_must_be_hex(self) -> None:
+        with pytest.raises(Exception) as excinfo:
+            RewriteCommitMessagesInput(
+                repo_path="/tmp",
+                manual_commit_mappings={"HEAD": "new message"},
+            )
+        assert "manual_commit_mappings" in str(excinfo.value)
 
     @pytest.mark.parametrize("style", ["conventional", "gitmoji", "simple", "detailed"])
     def test_all_valid_styles_accepted(self, style: str) -> None:
@@ -492,6 +502,7 @@ class TestAIProviderHandlers:
 
         assert result["success"] is False
         assert result["connected"] is False
+        assert "offline" in result["error"]
         assert result["error_code"] == ErrorCode.AI_CONNECTION_FAILED
 
 
@@ -785,6 +796,46 @@ class TestRewriteCommitMessages:
         assert "backup_branch" not in result
         patched_adapter.create_backup.assert_not_called()
 
+    async def test_manual_commit_mappings_resolve_hash_and_apply_callback(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        patched_adapter.get_commits.return_value = [
+            make_ci("abc123def456", "old"),
+            make_ci("def456abc123", "keep"),
+        ]
+        patched_adapter.rewrite_commit_messages.return_value = make_fr(
+            commits_processed=2, commits_rewritten=1, dry_run=True,
+        )
+
+        result = await _execute_tool("rewrite_commit_messages", {
+            "repo_path": "/tmp/repo",
+            "manual_commit_mappings": {"abc123": "feat: approved message"},
+            "dry_run": True,
+        })
+
+        assert result["success"] is True
+        assert result["manual_commit_mappings_resolved"] == 1
+        patched_adapter.get_commits.assert_called_once_with("HEAD")
+        callback = patched_adapter.rewrite_commit_messages.call_args.args[0]
+        assert callback("old", "abc123def456") == "feat: approved message"
+        assert callback("keep", "def456abc123") == "keep"
+
+    async def test_manual_commit_mappings_reject_missing_hash(
+        self, patched_adapter: MagicMock,
+    ) -> None:
+        patched_adapter.get_commits.return_value = [make_ci("abc123def456", "old")]
+
+        result = await _execute_tool("rewrite_commit_messages", {
+            "repo_path": "/tmp/repo",
+            "manual_commit_mappings": {"deadbeef": "new"},
+            "dry_run": True,
+        })
+
+        assert result["success"] is False
+        assert result["error_code"] == ErrorCode.INVALID_INPUT
+        assert "not found" in result["error"]
+        patched_adapter.rewrite_commit_messages.assert_not_called()
+
     async def test_invalid_style_rejected_by_pydantic(self) -> None:
         result = await _execute_tool("rewrite_commit_messages", {
             "repo_path": "/tmp/repo", "use_ai": True, "style": "nonexistent",
@@ -798,18 +849,18 @@ class TestRewriteCommitMessages:
         """Regression: the AI flow must call ``collect_commit_files`` once,
         not ``get_commit_files`` per commit."""
         mock_commits = [
-            make_ci("aaa111", "msg1"),
-            make_ci("bbb222", "msg2"),
+            make_ci("aaa111def456", "msg1"),
+            make_ci("bbb222def456", "msg2"),
         ]
         patched_adapter.get_commits.return_value = mock_commits
         patched_adapter.collect_commit_files.return_value = {
-            "aaa111": ["file1.py"], "bbb222": ["file2.py"],
+            "aaa111def456": ["file1.py"], "bbb222def456": ["file2.py"],
         }
 
         mock_engine = MagicMock()
         mock_engine.rewrite_batch = AsyncMock(return_value=[
-            MagicMock(original="msg1", rewritten="feat: msg1", commit_hash="aaa111"),
-            MagicMock(original="msg2", rewritten="feat: msg2", commit_hash="bbb222"),
+            SimpleNamespace(original="msg1", rewritten="feat: msg1", commit_hash="aaa111def456", reasoning=None),
+            SimpleNamespace(original="msg2", rewritten="feat: msg2", commit_hash="bbb222def456", reasoning=None),
         ])
         mock_engine.close = AsyncMock()
 
@@ -818,7 +869,7 @@ class TestRewriteCommitMessages:
                    new_callable=AsyncMock, return_value=None), \
              patch("git_filter_repo_mcp.server.AICommitEngine", return_value=mock_engine):
             mock_create.return_value = MagicMock(close=AsyncMock())
-            await _execute_tool("rewrite_commit_messages", {
+            result = await _execute_tool("rewrite_commit_messages", {
                 "repo_path": "/tmp/repo", "use_ai": True,
                 "ai_provider": "ollama", "dry_run": True,
                 "max_commits": 2,
@@ -832,6 +883,8 @@ class TestRewriteCommitMessages:
         mock_engine.rewrite_batch.assert_awaited_once()
         assert mock_engine.rewrite_batch.await_args.kwargs["max_concurrency"] == 3
         patched_adapter.get_commit_files.assert_not_called()
+        assert result["commits_to_rewrite"][0]["hash"] == "aaa111def456"
+        assert result["commits_to_rewrite"][0]["hash_short"] == "aaa111de"
 
 
 # =========================================================================
