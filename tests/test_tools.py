@@ -21,6 +21,8 @@ EXPECTED_TOOLS: frozenset[str] = frozenset({
     "find_large_files",
     "list_backups",
     "resolve_commit",
+    "list_ai_providers",
+    "check_ai_provider",
     "rewrite_commit_messages",
     "change_author",
     "remove_files_from_history",

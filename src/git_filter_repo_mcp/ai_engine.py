@@ -1,4 +1,4 @@
-"""AI-powered commit message engine using Ollama, OpenAI, or Anthropic."""
+"""AI-powered commit message engine using local or hosted LLM providers."""
 
 import asyncio
 import logging
@@ -10,6 +10,31 @@ from typing import Protocol
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+OPENAI_COMPATIBLE_PROVIDERS = frozenset({
+    "openai-compatible",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
+    "localai",
+    "openrouter",
+})
+SUPPORTED_AI_PROVIDERS = frozenset({
+    "ollama",
+    "openai",
+    "anthropic",
+    *OPENAI_COMPATIBLE_PROVIDERS,
+})
+
+_PROVIDER_LABELS = {
+    "openai-compatible": "OpenAI-compatible",
+    "lmstudio": "LM Studio",
+    "vllm": "vLLM",
+    "llamacpp": "llama.cpp",
+    "localai": "LocalAI",
+    "openrouter": "OpenRouter",
+}
 
 
 class AIConnectionError(Exception):
@@ -290,7 +315,7 @@ class OpenAIProvider(BaseProvider):
     ):
         super().__init__(model, raise_on_error, temperature, max_tokens)
         self.api_key = api_key
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.client = self._create_client()
 
     def _create_client(self) -> httpx.AsyncClient:
@@ -332,6 +357,77 @@ class OpenAIProvider(BaseProvider):
             logger.warning("openai unexpected response: %s", result)
             if self.raise_on_error:
                 raise AIConnectionError("OpenAI", "Unexpected response format")
+            return ""
+
+
+class OpenAICompatibleProvider(BaseProvider):
+    """Provider for OpenAI-compatible local and third-party APIs.
+
+    This covers LM Studio, vLLM, llama.cpp server, LocalAI, OpenRouter, and
+    similar services exposing ``/v1/chat/completions``. API keys are optional
+    because most local servers do not require them.
+    """
+
+    provider_name = "OpenAI-compatible"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "local-model",
+        base_url: str = "http://localhost:1234/v1",
+        provider_name: str = "OpenAI-compatible",
+        raise_on_error: bool = True,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ):
+        super().__init__(model, raise_on_error, temperature, max_tokens)
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.provider_name = provider_name
+        self.client = self._create_client()
+
+    def _create_client(self) -> httpx.AsyncClient:
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        return httpx.AsyncClient(timeout=30.0, headers=headers)
+
+    async def check_connection(self) -> tuple[bool, str]:
+        try:
+            response = await self.client.get(f"{self.base_url}/models", timeout=5.0)
+            if response.status_code in (401, 403):
+                return False, "Invalid API key"
+            if response.status_code in (404, 405):
+                return True, "Connected (model list endpoint unavailable)"
+            response.raise_for_status()
+            return True, "Connected"
+        except httpx.ConnectError:
+            return False, f"Cannot connect to {self.provider_name} at {self.base_url}"
+        except httpx.HTTPError as e:
+            return False, f"{self.provider_name}: {e}"
+
+    async def _call_api(self, prompt: str) -> str:
+        response = await self.client.post(
+            f"{self.base_url}/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a git commit message writer. Respond only with the commit message.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+        try:
+            return result["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            logger.warning("%s unexpected response: %s", self.provider_name.lower(), result)
+            if self.raise_on_error:
+                raise AIConnectionError(self.provider_name, "Unexpected response format")
             return ""
 
 
@@ -493,7 +589,7 @@ def get_provider(
     """Provider factory.
 
     Common kwargs: model, temperature, max_tokens, raise_on_error.
-    Provider-specific: base_url (ollama), api_key (openai/anthropic).
+    Provider-specific: base_url (ollama/openai-compatible), api_key.
     """
     common = {}
     for key in ("temperature", "max_tokens", "raise_on_error"):
@@ -523,6 +619,17 @@ def get_provider(
         return AnthropicProvider(
             api_key=api_key,
             model=kwargs.get("model", "claude-sonnet-4-20250514"),
+            **common,
+        )
+    elif provider_type in OPENAI_COMPATIBLE_PROVIDERS:
+        api_key = kwargs.get("api_key")
+        if provider_type == "openrouter" and not api_key:
+            raise ValueError("OpenRouter API key required")
+        return OpenAICompatibleProvider(
+            api_key=api_key,
+            model=kwargs.get("model", "local-model"),
+            base_url=kwargs.get("base_url", "http://localhost:1234/v1"),
+            provider_name=_PROVIDER_LABELS.get(provider_type, "OpenAI-compatible"),
             **common,
         )
     else:

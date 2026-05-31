@@ -25,6 +25,7 @@ class ToolCategory(str, Enum):
     """High-level tool grouping used for docs and registry metadata."""
 
     ANALYSIS = "analysis"
+    AI = "ai"
     MODIFICATION = "modification"
     BACKUP = "backup"
 
@@ -77,12 +78,33 @@ class _DestructiveRepoInput(_RepoInput):
 
 _AIProviderField = Field(
     default=None,
-    description="AI provider: ollama, openai, or anthropic (uses config default if not set)",
+    description=(
+        "AI provider: ollama, openai, anthropic, openai-compatible, "
+        "lmstudio, vllm, llamacpp, localai, or openrouter "
+        "(uses config default if not set)"
+    ),
 )
 _AIModelField = Field(
     default=None, description="AI model to use (uses config default if not set)",
 )
-AIProvider = Literal["ollama", "openai", "anthropic"]
+_AIBaseUrlField = Field(
+    default=None,
+    description=(
+        "Override provider base URL for this call. Useful for local OpenAI-compatible "
+        "servers such as LM Studio, vLLM, llama.cpp, or LocalAI."
+    ),
+)
+AIProvider = Literal[
+    "ollama",
+    "openai",
+    "anthropic",
+    "openai-compatible",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
+    "localai",
+    "openrouter",
+]
 
 _BACKUP_BRANCH_RE = re.compile(r"^backup_\d{8}_\d{6}_\d{6}$")
 _HEX_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
@@ -129,6 +151,15 @@ def _identity_value(value: str | None, field_name: str) -> str | None:
         raise ValueError(
             f"{field_name} must not contain angle brackets, tabs, or newlines"
         )
+    return value
+
+
+def _url_value(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    _non_blank(value, field_name)
+    if any(char in value for char in "\n\r\t"):
+        raise ValueError(f"{field_name} must not contain control characters")
     return value
 
 
@@ -192,6 +223,43 @@ class ResolveCommitInput(_RepoInput):
         return _git_ref(value, "commit_ref")
 
 
+class ListAIProvidersInput(BaseModel):
+    """Input for list_ai_providers tool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CheckAIProviderInput(BaseModel):
+    """Input for check_ai_provider tool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ai_provider: AIProvider | None = _AIProviderField
+    ai_model: str | None = _AIModelField
+    ai_base_url: str | None = _AIBaseUrlField
+    ai_temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Override generation temperature for the provider check metadata",
+    )
+    ai_max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        le=4096,
+        description="Override max tokens for generated commit messages",
+    )
+    check_connection: bool = Field(
+        default=True,
+        description="If false, only resolve provider configuration without contacting it",
+    )
+
+    @field_validator("ai_base_url")
+    @classmethod
+    def _validate_ai_base_url(cls, value: str | None) -> str | None:
+        return _url_value(value, "ai_base_url")
+
+
 class RewriteCommitMessagesInput(_DestructiveRepoInput):
     """Input for rewrite_commit_messages tool."""
 
@@ -203,6 +271,35 @@ class RewriteCommitMessagesInput(_DestructiveRepoInput):
     use_ai: bool = Field(default=False, description="Use AI to generate new messages")
     ai_provider: AIProvider | None = _AIProviderField
     ai_model: str | None = _AIModelField
+    ai_base_url: str | None = _AIBaseUrlField
+    ai_temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Override generation temperature",
+    )
+    ai_max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        le=4096,
+        description="Override max tokens for each generated commit message",
+    )
+    ai_check_connection: bool = Field(
+        default=True,
+        description="Check provider connectivity before generating messages",
+    )
+    ai_max_concurrency: int = Field(
+        default=5,
+        gt=0,
+        le=20,
+        description="Maximum concurrent AI requests when rewriting a batch",
+    )
+    max_commits: int | None = Field(
+        default=None,
+        gt=0,
+        le=10000,
+        description="Limit AI rewriting to the newest N commits on the selected branch",
+    )
     manual_mappings: dict[str, str] | None = Field(
         default=None, description="Manual message mappings: {old_message: new_message}"
     )
@@ -211,6 +308,11 @@ class RewriteCommitMessagesInput(_DestructiveRepoInput):
     @classmethod
     def _validate_branch(cls, value: str) -> str:
         return _git_ref(value, "branch")
+
+    @field_validator("ai_base_url")
+    @classmethod
+    def _validate_ai_base_url(cls, value: str | None) -> str | None:
+        return _url_value(value, "ai_base_url")
 
 
 class ChangeAuthorInput(_DestructiveRepoInput):
@@ -318,6 +420,23 @@ class RewriteSingleCommitInput(_DestructiveRepoInput):
     use_ai: bool = Field(default=False, description="Use AI to generate message if not provided")
     ai_provider: AIProvider | None = _AIProviderField
     ai_model: str | None = _AIModelField
+    ai_base_url: str | None = _AIBaseUrlField
+    ai_temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Override generation temperature",
+    )
+    ai_max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        le=4096,
+        description="Override max tokens for the generated commit message",
+    )
+    ai_check_connection: bool = Field(
+        default=True,
+        description="Check provider connectivity before generating the message",
+    )
 
     @field_validator("commit_hash")
     @classmethod
@@ -331,6 +450,11 @@ class RewriteSingleCommitInput(_DestructiveRepoInput):
     @classmethod
     def _validate_author_identity(cls, value: str | None, info) -> str | None:
         return _identity_value(value, info.field_name)
+
+    @field_validator("ai_base_url")
+    @classmethod
+    def _validate_ai_base_url(cls, value: str | None) -> str | None:
+        return _url_value(value, "ai_base_url")
 
     @model_validator(mode="after")
     def _validate_author_pair(self) -> "RewriteSingleCommitInput":
@@ -522,14 +646,34 @@ Use this before restore_backup to choose an available backup branch.""",
 Accepts a commit hash, abbreviated hash, branch, tag, or other git commit ref.""",
     ),
     ToolSpec(
+        name="list_ai_providers",
+        category=ToolCategory.AI,
+        input_model=ListAIProvidersInput,
+        description="""List AI providers supported by git-filter-repo-mcp.
+
+Use this to discover local and third-party provider names before calling
+rewrite_commit_messages or rewrite_single_commit with use_ai=true.""",
+    ),
+    ToolSpec(
+        name="check_ai_provider",
+        category=ToolCategory.AI,
+        input_model=CheckAIProviderInput,
+        description="""Resolve and optionally check an AI provider configuration.
+
+Use this before AI-based rewrite tools to verify Ollama, LM Studio, vLLM,
+llama.cpp, LocalAI, OpenAI, Anthropic, or OpenRouter settings without
+modifying the repository.""",
+    ),
+    ToolSpec(
         name="rewrite_commit_messages",
         category=ToolCategory.MODIFICATION,
         input_model=RewriteCommitMessagesInput,
         destructive=True,
         description="""Rewrite commit messages in the repository history.
 
-Can use AI (Ollama/OpenAI) to automatically generate better commit messages,
-or accept manual mappings for specific messages.
+Can use AI (Ollama/OpenAI/Anthropic/OpenAI-compatible local or third-party
+providers) to automatically generate better commit messages, or accept manual
+mappings for specific messages.
 
 Supports multiple styles:
 - conventional: feat:, fix:, docs:, etc.

@@ -26,6 +26,7 @@ from git_filter_repo_mcp.ai_engine import (
     CommitContext,
     MessageStyle,
     OllamaProvider,
+    OpenAICompatibleProvider,
     OpenAIProvider,
     RewriteResult,
     build_prompt,
@@ -66,6 +67,10 @@ def _openai_factory() -> OpenAIProvider:
     return OpenAIProvider(api_key="test")
 
 
+def _openai_compatible_factory() -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider()
+
+
 def _anthropic_factory() -> AnthropicProvider:
     return AnthropicProvider(api_key="test")
 
@@ -75,6 +80,7 @@ def _anthropic_factory() -> AnthropicProvider:
 ALL_PROVIDERS: list[tuple[str, Callable[[], BaseProvider]]] = [
     ("ollama", _ollama_factory),
     ("openai", _openai_factory),
+    ("openai-compatible", _openai_compatible_factory),
     ("anthropic", _anthropic_factory),
 ]
 
@@ -196,6 +202,20 @@ class TestProviderInit:
         p = OpenAIProvider(api_key="test-key", **kwargs)
         assert getattr(p, attr) == expected
 
+    def test_openai_compatible_defaults(self) -> None:
+        p = OpenAICompatibleProvider()
+        assert p.api_key is None
+        assert p.model == "local-model"
+        assert p.base_url == "http://localhost:1234/v1"
+        assert p.provider_name == "OpenAI-compatible"
+
+    def test_openai_compatible_optional_auth_header(self) -> None:
+        without_key = OpenAICompatibleProvider()
+        assert "authorization" not in {key.lower() for key in without_key.client.headers}
+
+        with_key = OpenAICompatibleProvider(api_key="local-key")
+        assert with_key.client.headers["authorization"] == "Bearer local-key"
+
     def test_anthropic_defaults(self) -> None:
         p = AnthropicProvider(api_key="test-key")
         assert p.api_key == "test-key"
@@ -254,6 +274,40 @@ class TestGetProviderFactory:
         p = get_provider("openai", api_key="x", base_url="https://custom.com/v1")
         assert isinstance(p, OpenAIProvider) and p.base_url == "https://custom.com/v1"
 
+    def test_openai_compatible_without_key(self) -> None:
+        p = get_provider(
+            "openai-compatible",
+            base_url="http://localhost:9999/v1",
+            model="qwen-local",
+        )
+        assert isinstance(p, OpenAICompatibleProvider)
+        assert p.api_key is None
+        assert (p.base_url, p.model) == ("http://localhost:9999/v1", "qwen-local")
+
+    @pytest.mark.parametrize(
+        "provider_type,label",
+        [
+            ("lmstudio", "LM Studio"),
+            ("vllm", "vLLM"),
+            ("llamacpp", "llama.cpp"),
+            ("localai", "LocalAI"),
+        ],
+    )
+    def test_openai_compatible_aliases(self, provider_type: str, label: str) -> None:
+        p = get_provider(provider_type, base_url="http://local/v1", model="local-model")
+        assert isinstance(p, OpenAICompatibleProvider)
+        assert p.provider_name == label
+
+    def test_openrouter_requires_key_and_uses_compatible_provider(self) -> None:
+        p = get_provider(
+            "openrouter",
+            api_key="router-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="openai/gpt-4o-mini",
+        )
+        assert isinstance(p, OpenAICompatibleProvider)
+        assert p.provider_name == "OpenRouter"
+
     def test_anthropic_with_key(self) -> None:
         assert isinstance(get_provider("anthropic", api_key="x"), AnthropicProvider)
 
@@ -266,6 +320,7 @@ class TestGetProviderFactory:
         [
             ("openai", "OpenAI API key required"),
             ("anthropic", "Anthropic API key required"),
+            ("openrouter", "OpenRouter API key required"),
             ("unknown", "Unknown provider"),
         ],
     )
@@ -305,6 +360,21 @@ class TestProviderHTTP:
             _ctx("fix bug", files=["main.py"]), MessageStyle.CONVENTIONAL,
         )
         assert result == "fix: resolve null pointer"
+
+    @pytest.mark.asyncio
+    async def test_openai_compatible_generate_success(self) -> None:
+        provider = OpenAICompatibleProvider(base_url="http://localhost:1234/v1")
+        provider.client = AsyncMock()
+        provider.client.post.return_value = _make_response(
+            json_data={"choices": [{"message": {"content": "chore: clean commits"}}]},
+        )
+        result = await provider.generate_message(
+            _ctx("cleanup", files=["main.py"]), MessageStyle.CONVENTIONAL,
+        )
+        assert result == "chore: clean commits"
+        provider.client.post.assert_called_once()
+        url = provider.client.post.call_args.args[0]
+        assert url == "http://localhost:1234/v1/chat/completions"
 
     @pytest.mark.asyncio
     async def test_anthropic_generate_success(self) -> None:
@@ -359,6 +429,15 @@ class TestProviderHTTP:
         connected, status = await provider.check_connection()
         assert connected is False
         assert "Invalid API key" in status
+
+    @pytest.mark.asyncio
+    async def test_openai_compatible_check_connection_model_endpoint_optional(self) -> None:
+        provider = OpenAICompatibleProvider()
+        provider.client = AsyncMock()
+        provider.client.get.return_value = _make_response(status_code=404)
+        connected, status = await provider.check_connection()
+        assert connected is True
+        assert "unavailable" in status
 
     @pytest.mark.asyncio
     async def test_anthropic_check_connection_rate_limit_is_ok(self) -> None:

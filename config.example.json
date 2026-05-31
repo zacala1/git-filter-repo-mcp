@@ -5,7 +5,15 @@
     "ollama_base_url": "http://localhost:11434",
     "openai_api_key": null,
     "openai_base_url": "https://api.openai.com/v1",
-    "anthropic_api_key": null
+    "anthropic_api_key": null,
+    "openai_compatible_api_key": null,
+    "openai_compatible_base_url": "http://localhost:1234/v1",
+    "lmstudio_base_url": "http://localhost:1234/v1",
+    "vllm_base_url": "http://localhost:8000/v1",
+    "llamacpp_base_url": "http://localhost:8080/v1",
+    "localai_base_url": "http://localhost:8080/v1",
+    "openrouter_api_key": null,
+    "openrouter_base_url": "https://openrouter.ai/api/v1"
   },
   "server": {
     "log_level": "INFO",

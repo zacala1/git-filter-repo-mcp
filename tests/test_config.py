@@ -30,6 +30,14 @@ _ALL_CONFIG_ENV_VARS = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "ANTHROPIC_API_KEY",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "OPENAI_COMPATIBLE_BASE_URL",
+    "LMSTUDIO_BASE_URL",
+    "VLLM_BASE_URL",
+    "LLAMACPP_BASE_URL",
+    "LOCALAI_BASE_URL",
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_BASE_URL",
 )
 
 
@@ -68,6 +76,14 @@ class TestDataclassDefaults:
         assert ai.openai_api_key is None
         assert ai.openai_base_url == "https://api.openai.com/v1"
         assert ai.anthropic_api_key is None
+        assert ai.openai_compatible_api_key is None
+        assert ai.openai_compatible_base_url == "http://localhost:1234/v1"
+        assert ai.lmstudio_base_url == "http://localhost:1234/v1"
+        assert ai.vllm_base_url == "http://localhost:8000/v1"
+        assert ai.llamacpp_base_url == "http://localhost:8080/v1"
+        assert ai.localai_base_url == "http://localhost:8080/v1"
+        assert ai.openrouter_api_key is None
+        assert ai.openrouter_base_url == "https://openrouter.ai/api/v1"
 
     def test_server_section_defaults(self) -> None:
         server = ServerConfig()
@@ -88,6 +104,29 @@ class TestApplyEnvVars:
             ("OLLAMA_BASE_URL", "http://custom:11434", "ai.ollama_base_url", "http://custom:11434"),
             ("OPENAI_BASE_URL", "https://proxy/v1", "ai.openai_base_url", "https://proxy/v1"),
             ("ANTHROPIC_API_KEY", "ant-key", "ai.anthropic_api_key", "ant-key"),
+            (
+                "OPENAI_COMPATIBLE_API_KEY",
+                "compat-key",
+                "ai.openai_compatible_api_key",
+                "compat-key",
+            ),
+            (
+                "OPENAI_COMPATIBLE_BASE_URL",
+                "http://local:1234/v1",
+                "ai.openai_compatible_base_url",
+                "http://local:1234/v1",
+            ),
+            ("LMSTUDIO_BASE_URL", "http://lmstudio/v1", "ai.lmstudio_base_url", "http://lmstudio/v1"),
+            ("VLLM_BASE_URL", "http://vllm/v1", "ai.vllm_base_url", "http://vllm/v1"),
+            ("LLAMACPP_BASE_URL", "http://llama/v1", "ai.llamacpp_base_url", "http://llama/v1"),
+            ("LOCALAI_BASE_URL", "http://localai/v1", "ai.localai_base_url", "http://localai/v1"),
+            ("OPENROUTER_API_KEY", "or-key", "ai.openrouter_api_key", "or-key"),
+            (
+                "OPENROUTER_BASE_URL",
+                "https://openrouter.example/v1",
+                "ai.openrouter_base_url",
+                "https://openrouter.example/v1",
+            ),
             ("GIT_FILTER_REPO_LOG_LEVEL", "DEBUG", "server.log_level", "DEBUG"),
         ],
     )
@@ -143,11 +182,19 @@ class TestApplyConfigDict:
     def test_ai_section_applied(self) -> None:
         config = Config()
         _apply_config_dict(config, {
-            "ai": {"provider": "openai", "model": "gpt-4", "openai_api_key": "sk-test"},
+            "ai": {
+                "provider": "openai-compatible",
+                "model": "qwen-local",
+                "openai_compatible_api_key": "local-key",
+                "openai_compatible_base_url": "http://localhost:1234/v1",
+                "openrouter_api_key": "or-key",
+            },
         })
-        assert config.ai.provider == "openai"
-        assert config.ai.model == "gpt-4"
-        assert config.ai.openai_api_key == "sk-test"
+        assert config.ai.provider == "openai-compatible"
+        assert config.ai.model == "qwen-local"
+        assert config.ai.openai_compatible_api_key == "local-key"
+        assert config.ai.openai_compatible_base_url == "http://localhost:1234/v1"
+        assert config.ai.openrouter_api_key == "or-key"
 
     def test_server_section_applied(self) -> None:
         config = Config()

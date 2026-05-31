@@ -13,12 +13,20 @@ from mcp.types import TextContent, Tool
 from pydantic import ValidationError
 
 from .adapter import FilterResult, GitFilterRepoAdapter
-from .ai_engine import AICommitEngine, AIConnectionError, MessageStyle, get_provider
+from .ai_engine import (
+    AICommitEngine,
+    AIConnectionError,
+    MessageStyle,
+    OPENAI_COMPATIBLE_PROVIDERS,
+    SUPPORTED_AI_PROVIDERS,
+    get_provider,
+)
 from .config import get_config
 from .tools import (
     TOOL_DEFINITIONS,
     DESTRUCTIVE_TOOL_NAMES,
     AnalyzeHistoryInput,
+    CheckAIProviderInput,
     ErrorCode,
     ChangeAuthorInput,
     ChangeCommitDatesInput,
@@ -28,6 +36,7 @@ from .tools import (
     GetCommitDetailsInput,
     GetFileHistoryInput,
     ListAllFilesInput,
+    ListAIProvidersInput,
     ListBackupsInput,
     RemoveFilesInput,
     RemoveLargeFilesInput,
@@ -154,12 +163,37 @@ def _run_destructive(
     return response
 
 
-_VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic"}
+_VALID_AI_PROVIDERS = SUPPORTED_AI_PROVIDERS
 _CONFIG_DEFAULT_AI_MODEL = "llama3.2"
 _PROVIDER_DEFAULT_MODELS = {
     "ollama": "llama3.2",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-20250514",
+    "openai-compatible": "local-model",
+    "lmstudio": "local-model",
+    "vllm": "local-model",
+    "llamacpp": "local-model",
+    "localai": "local-model",
+    "openrouter": "openai/gpt-4o-mini",
+}
+_PROVIDER_DESCRIPTIONS = {
+    "ollama": "Local Ollama server (/api/generate)",
+    "openai": "Official OpenAI Chat Completions API",
+    "anthropic": "Official Anthropic Messages API",
+    "openai-compatible": "Generic OpenAI-compatible /v1/chat/completions endpoint",
+    "lmstudio": "LM Studio local server",
+    "vllm": "vLLM OpenAI-compatible server",
+    "llamacpp": "llama.cpp OpenAI-compatible server",
+    "localai": "LocalAI OpenAI-compatible server",
+    "openrouter": "OpenRouter OpenAI-compatible gateway",
+}
+_PROVIDER_BASE_URL_FIELDS = {
+    "openai-compatible": "openai_compatible_base_url",
+    "lmstudio": "lmstudio_base_url",
+    "vllm": "vllm_base_url",
+    "llamacpp": "llamacpp_base_url",
+    "localai": "localai_base_url",
+    "openrouter": "openrouter_base_url",
 }
 
 
@@ -173,6 +207,37 @@ def _resolve_ai_model(args: dict, provider_name: str, configured_model: str) -> 
     return _PROVIDER_DEFAULT_MODELS[provider_name]
 
 
+def _provider_base_url(cfg, args: dict, provider_name: str) -> str | None:
+    """Resolve a provider base URL without leaking credentials."""
+    if base_url := args.get("ai_base_url"):
+        return base_url
+    if provider_name == "ollama":
+        return cfg.ai.ollama_base_url
+    if provider_name == "openai":
+        return cfg.ai.openai_base_url
+    if provider_name in _PROVIDER_BASE_URL_FIELDS:
+        default_url = {
+            "openai-compatible": "http://localhost:1234/v1",
+            "lmstudio": "http://localhost:1234/v1",
+            "vllm": "http://localhost:8000/v1",
+            "llamacpp": "http://localhost:8080/v1",
+            "localai": "http://localhost:8080/v1",
+            "openrouter": "https://openrouter.ai/api/v1",
+        }[provider_name]
+        return getattr(cfg.ai, _PROVIDER_BASE_URL_FIELDS[provider_name], default_url)
+    return None
+
+
+def _ai_runtime_options(args: dict) -> dict:
+    """Extract optional generation knobs accepted by all providers."""
+    options: dict = {}
+    if args.get("ai_temperature") is not None:
+        options["temperature"] = args["ai_temperature"]
+    if args.get("ai_max_tokens") is not None:
+        options["max_tokens"] = args["ai_max_tokens"]
+    return options
+
+
 def _create_ai_provider(args: dict, provider_name: str):
     """Create an AI provider instance from tool args and global config.
 
@@ -183,15 +248,34 @@ def _create_ai_provider(args: dict, provider_name: str):
             f"Invalid AI provider: {provider_name!r}. Must be one of: {', '.join(sorted(_VALID_AI_PROVIDERS))}"
         )
     cfg = get_config()
-    kwargs: dict = {"model": _resolve_ai_model(args, provider_name, cfg.ai.model)}
+    kwargs: dict = {
+        "model": _resolve_ai_model(args, provider_name, cfg.ai.model),
+        **_ai_runtime_options(args),
+    }
+    if base_url := _provider_base_url(cfg, args, provider_name):
+        kwargs["base_url"] = base_url
     if provider_name == "ollama":
-        kwargs["base_url"] = cfg.ai.ollama_base_url
+        pass
     elif provider_name == "openai":
         kwargs["api_key"] = cfg.ai.openai_api_key
-        kwargs["base_url"] = cfg.ai.openai_base_url
     elif provider_name == "anthropic":
         kwargs["api_key"] = cfg.ai.anthropic_api_key
+    elif provider_name == "openrouter":
+        kwargs["api_key"] = getattr(cfg.ai, "openrouter_api_key", None)
+    elif provider_name in OPENAI_COMPATIBLE_PROVIDERS:
+        kwargs["api_key"] = getattr(cfg.ai, "openai_compatible_api_key", None)
     return get_provider(provider_name, **kwargs)
+
+
+def _ai_provider_metadata(provider, provider_name: str) -> dict:
+    """Safe provider metadata for MCP responses."""
+    data = {
+        "ai_provider": provider_name,
+        "ai_model": getattr(provider, "model", None),
+    }
+    if base_url := getattr(provider, "base_url", None):
+        data["ai_base_url"] = base_url
+    return data
 
 
 def _ai_provider_config_error(provider_name: str, error: Exception) -> dict:
@@ -290,6 +374,67 @@ async def _handle_resolve_commit(args: dict) -> dict:
     return await asyncio.to_thread(_run)
 
 
+@tool_handler("list_ai_providers")
+async def _handle_list_ai_providers(args: dict) -> dict:
+    ListAIProvidersInput(**args)
+    providers = []
+    for name in sorted(_VALID_AI_PROVIDERS):
+        provider = {
+            "name": name,
+            "description": _PROVIDER_DESCRIPTIONS[name],
+            "default_model": _PROVIDER_DEFAULT_MODELS[name],
+            "requires_api_key": name in {"openai", "anthropic", "openrouter"},
+            "local_first": name in {
+                "ollama",
+                "openai-compatible",
+                "lmstudio",
+                "vllm",
+                "llamacpp",
+                "localai",
+            },
+        }
+        if name in _PROVIDER_BASE_URL_FIELDS:
+            provider["base_url_config_key"] = _PROVIDER_BASE_URL_FIELDS[name]
+        providers.append(provider)
+    return {"success": True, "providers": providers}
+
+
+@tool_handler("check_ai_provider")
+async def _handle_check_ai_provider(args: dict) -> dict:
+    params = CheckAIProviderInput(**args)
+    provider_name = params.ai_provider or get_config().ai.provider
+    if provider_name == "none":
+        return {
+            "success": False,
+            "error": "AI provider is set to 'none'. Configure a provider or pass ai_provider explicitly.",
+            "error_code": ErrorCode.INVALID_INPUT,
+        }
+    try:
+        provider = _create_ai_provider(args, provider_name)
+    except ValueError as e:
+        return _ai_provider_config_error(provider_name, e)
+
+    try:
+        response = {"success": True, **_ai_provider_metadata(provider, provider_name)}
+        if not params.check_connection:
+            response["connected"] = None
+            response["status"] = "Connection check skipped"
+            return response
+
+        connected, status = await provider.check_connection()
+        response["connected"] = connected
+        response["status"] = status
+        if not connected:
+            response["success"] = False
+            response["error_code"] = ErrorCode.AI_CONNECTION_FAILED
+        return response
+    finally:
+        try:
+            await provider.close()
+        except Exception:
+            logger.warning("AI provider close failed", exc_info=True)
+
+
 @tool_handler("rewrite_commit_messages")
 async def _handle_rewrite_messages(args: dict) -> dict:
     params = RewriteCommitMessagesInput(**args)
@@ -318,10 +463,14 @@ async def _handle_rewrite_messages(args: dict) -> dict:
         engine = AICommitEngine(provider, MessageStyle(params.style))
 
         try:
-            if err := await _check_ai_connection(provider, ai_provider_name):
+            if params.ai_check_connection and (
+                err := await _check_ai_connection(provider, ai_provider_name)
+            ):
                 return err
 
-            commits = await asyncio.to_thread(adapter.get_commits, params.branch)
+            commits = await asyncio.to_thread(
+                adapter.get_commits, params.branch, params.max_commits,
+            )
             commit_files = await asyncio.to_thread(
                 adapter.collect_commit_files, commits, params.branch, len(commits),
             )
@@ -330,7 +479,10 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                 (c.hash, c.message, commit_files.get(c.hash, []))
                 for c in commits
             ]
-            results = await engine.rewrite_batch(batch_input)
+            results = await engine.rewrite_batch(
+                batch_input,
+                max_concurrency=params.ai_max_concurrency,
+            )
             ai_failures = [
                 r for r in results
                 if r.reasoning and r.reasoning.startswith("AI call failed")
@@ -340,7 +492,7 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                     "success": False,
                     "error": "AI failed to rewrite all commit messages",
                     "error_code": ErrorCode.AI_CONNECTION_FAILED,
-                    "ai_provider": ai_provider_name,
+                    **_ai_provider_metadata(provider, ai_provider_name),
                     "ai_failures": len(ai_failures),
                 }
 
@@ -364,16 +516,18 @@ async def _handle_rewrite_messages(args: dict) -> dict:
                         for r in rewrites[:20]
                     ],
                     "total_rewrites": len(rewrites),
-                    "ai_provider": ai_provider_name,
+                    **_ai_provider_metadata(provider, ai_provider_name),
                     "ai_failures": len(ai_failures),
+                    "commits_considered": len(commits),
                 }
 
             if not rewrites:
                 return {
                     "success": True,
                     "message": "No commits need rewriting",
-                    "ai_provider": ai_provider_name,
+                    **_ai_provider_metadata(provider, ai_provider_name),
                     "ai_failures": len(ai_failures),
+                    "commits_considered": len(commits),
                 }
 
             backup = _maybe_backup(adapter, dry_run)
@@ -388,6 +542,8 @@ async def _handle_rewrite_messages(args: dict) -> dict:
             )
             response = result_to_dict(result)
             response["ai_failures"] = len(ai_failures)
+            response.update(_ai_provider_metadata(provider, ai_provider_name))
+            response["commits_considered"] = len(commits)
             if backup:
                 response["backup_branch"] = backup
             return response
@@ -546,7 +702,9 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
             return _ai_provider_config_error(ai_provider_name, e)
         engine = AICommitEngine(provider, MessageStyle.CONVENTIONAL)
         try:
-            if err := await _check_ai_connection(provider, ai_provider_name):
+            if params.ai_check_connection and (
+                err := await _check_ai_connection(provider, ai_provider_name)
+            ):
                 return err
             files = await asyncio.to_thread(adapter.get_commit_files, commit.hash)
             result = await engine.rewrite_message(commit.message, commit.hash, files)
@@ -581,7 +739,7 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         }
 
     if params.dry_run:
-        return {
+        response = {
             "success": True,
             "dry_run": True,
             "commit_hash": commit_hash,
@@ -590,6 +748,9 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
             "new_author_name": params.new_author_name,
             "new_author_email": params.new_author_email,
         }
+        if params.use_ai:
+            response.update(_ai_provider_metadata(provider, ai_provider_name))
+        return response
 
     backup = _maybe_backup(adapter, params.dry_run)
     result = await asyncio.to_thread(
@@ -600,6 +761,8 @@ async def _handle_rewrite_single_commit(args: dict) -> dict:
         new_author_email=params.new_author_email if has_author_change else None,
     )
     response = result_to_dict(result)
+    if params.use_ai:
+        response.update(_ai_provider_metadata(provider, ai_provider_name))
     if backup:
         response["backup_branch"] = backup
     return response

@@ -32,6 +32,7 @@ from git_filter_repo_mcp.server import (
 )
 from git_filter_repo_mcp.tools import (
     AnalyzeHistoryInput,
+    CheckAIProviderInput,
     ChangeAuthorInput,
     ChangeCommitDatesInput,
     FindLargeFilesInput,
@@ -156,8 +157,43 @@ class TestPydanticInputValidation:
         params = RewriteCommitMessagesInput(repo_path="/tmp")
         assert params.use_ai is False
         assert params.ai_provider is None
+        assert params.ai_base_url is None
+        assert params.ai_max_concurrency == 5
+        assert params.ai_check_connection is True
         assert params.dry_run is True
         assert params.style == "conventional"
+
+    @pytest.mark.parametrize(
+        "provider",
+        [
+            "ollama",
+            "openai",
+            "anthropic",
+            "openai-compatible",
+            "lmstudio",
+            "vllm",
+            "llamacpp",
+            "localai",
+            "openrouter",
+        ],
+    )
+    def test_valid_ai_providers_accepted(self, provider: str) -> None:
+        params = RewriteCommitMessagesInput(
+            repo_path="/tmp",
+            use_ai=True,
+            ai_provider=provider,  # type: ignore[arg-type]
+        )
+        assert params.ai_provider == provider
+
+    def test_check_ai_provider_input_accepts_base_url_override(self) -> None:
+        params = CheckAIProviderInput(
+            ai_provider="lmstudio",
+            ai_base_url="http://localhost:1234/v1",
+            ai_temperature=0.2,
+            ai_max_tokens=80,
+        )
+        assert params.ai_provider == "lmstudio"
+        assert params.ai_base_url == "http://localhost:1234/v1"
 
     @pytest.mark.parametrize("style", ["conventional", "gitmoji", "simple", "detailed"])
     def test_all_valid_styles_accepted(self, style: str) -> None:
@@ -268,6 +304,7 @@ class TestListTools:
             "analyze_git_history", "rewrite_commit_messages",
             "change_author", "create_backup", "validate_repo_safety",
             "find_large_files", "list_backups", "resolve_commit",
+            "list_ai_providers", "check_ai_provider",
         } <= names
         for tool in tools:
             assert tool.name and tool.description and tool.inputSchema is not None
@@ -413,6 +450,49 @@ class TestResolveCommitHandler:
         })
         assert result["success"] is False
         assert result["error_code"] == ErrorCode.INVALID_INPUT
+
+
+class TestAIProviderHandlers:
+    async def test_list_ai_providers_includes_local_aliases(self) -> None:
+        result = await _execute_tool("list_ai_providers", {})
+        assert result["success"] is True
+        names = {provider["name"] for provider in result["providers"]}
+        assert {"ollama", "lmstudio", "vllm", "llamacpp", "localai"} <= names
+
+    async def test_check_ai_provider_skips_connection(self) -> None:
+        provider = MagicMock()
+        provider.model = "local-model"
+        provider.base_url = "http://localhost:1234/v1"
+        provider.close = AsyncMock()
+
+        with patch("git_filter_repo_mcp.server._create_ai_provider", return_value=provider):
+            result = await _execute_tool("check_ai_provider", {
+                "ai_provider": "lmstudio",
+                "ai_base_url": "http://localhost:1234/v1",
+                "check_connection": False,
+            })
+
+        assert result["success"] is True
+        assert result["ai_provider"] == "lmstudio"
+        assert result["ai_base_url"] == "http://localhost:1234/v1"
+        assert result["connected"] is None
+        provider.close.assert_awaited_once()
+
+    async def test_check_ai_provider_connection_failure(self) -> None:
+        provider = MagicMock()
+        provider.model = "local-model"
+        provider.base_url = "http://localhost:1234/v1"
+        provider.check_connection = AsyncMock(return_value=(False, "offline"))
+        provider.close = AsyncMock()
+
+        with patch("git_filter_repo_mcp.server._create_ai_provider", return_value=provider):
+            result = await _execute_tool("check_ai_provider", {
+                "ai_provider": "openai-compatible",
+            })
+
+        assert result["success"] is False
+        assert result["connected"] is False
+        assert result["error_code"] == ErrorCode.AI_CONNECTION_FAILED
 
 
 class TestGetCommitDetailsHandler:
@@ -741,11 +821,16 @@ class TestRewriteCommitMessages:
             await _execute_tool("rewrite_commit_messages", {
                 "repo_path": "/tmp/repo", "use_ai": True,
                 "ai_provider": "ollama", "dry_run": True,
+                "max_commits": 2,
+                "ai_max_concurrency": 3,
             })
 
+        patched_adapter.get_commits.assert_called_once_with("HEAD", 2)
         patched_adapter.collect_commit_files.assert_called_once_with(
             mock_commits, "HEAD", 2,
         )
+        mock_engine.rewrite_batch.assert_awaited_once()
+        assert mock_engine.rewrite_batch.await_args.kwargs["max_concurrency"] == 3
         patched_adapter.get_commit_files.assert_not_called()
 
 
@@ -963,6 +1048,43 @@ class TestAIProviderPlumbing:
             mock_gp.assert_called_once_with(
                 "openai", model="gpt-4o-mini", api_key="sk-test",
                 base_url="https://api.openai.com/v1",
+            )
+
+    def test_openai_compatible_base_url_and_knobs_forwarded(self) -> None:
+        from git_filter_repo_mcp.server import _create_ai_provider
+        with patch("git_filter_repo_mcp.server.get_config") as mock_gc, \
+             patch("git_filter_repo_mcp.server.get_provider") as mock_gp:
+            mock_gc.return_value.ai.model = "llama3.2"
+            mock_gc.return_value.ai.openai_compatible_api_key = None
+            mock_gc.return_value.ai.openai_compatible_base_url = "http://config/v1"
+            _create_ai_provider({
+                "ai_base_url": "http://override/v1",
+                "ai_model": "qwen-local",
+                "ai_temperature": 0.1,
+                "ai_max_tokens": 96,
+            }, "openai-compatible")
+            mock_gp.assert_called_once_with(
+                "openai-compatible",
+                model="qwen-local",
+                temperature=0.1,
+                max_tokens=96,
+                base_url="http://override/v1",
+                api_key=None,
+            )
+
+    def test_lmstudio_uses_alias_base_url(self) -> None:
+        from git_filter_repo_mcp.server import _create_ai_provider
+        with patch("git_filter_repo_mcp.server.get_config") as mock_gc, \
+             patch("git_filter_repo_mcp.server.get_provider") as mock_gp:
+            mock_gc.return_value.ai.model = "llama3.2"
+            mock_gc.return_value.ai.openai_compatible_api_key = "local-key"
+            mock_gc.return_value.ai.lmstudio_base_url = "http://lmstudio/v1"
+            _create_ai_provider({}, "lmstudio")
+            mock_gp.assert_called_once_with(
+                "lmstudio",
+                model="local-model",
+                base_url="http://lmstudio/v1",
+                api_key="local-key",
             )
 
     def test_rejects_none_provider(self) -> None:

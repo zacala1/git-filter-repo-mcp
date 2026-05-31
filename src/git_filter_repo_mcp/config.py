@@ -10,12 +10,25 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
+AIProviderName = Literal[
+    "ollama",
+    "openai",
+    "anthropic",
+    "openai-compatible",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
+    "localai",
+    "openrouter",
+    "none",
+]
+
 
 @dataclass
 class AIConfig:
     """AI provider configuration."""
 
-    provider: Literal["ollama", "openai", "anthropic", "none"] = "ollama"
+    provider: AIProviderName = "ollama"
     model: str = "llama3.2"
 
     # Ollama settings
@@ -27,6 +40,18 @@ class AIConfig:
 
     # Anthropic settings
     anthropic_api_key: str | None = None
+
+    # OpenAI-compatible local/third-party settings
+    openai_compatible_api_key: str | None = None
+    openai_compatible_base_url: str = "http://localhost:1234/v1"
+    lmstudio_base_url: str = "http://localhost:1234/v1"
+    vllm_base_url: str = "http://localhost:8000/v1"
+    llamacpp_base_url: str = "http://localhost:8080/v1"
+    localai_base_url: str = "http://localhost:8080/v1"
+
+    # OpenRouter uses the OpenAI-compatible API with an API key.
+    openrouter_api_key: str | None = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
 
 @dataclass
@@ -46,7 +71,18 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
 
 
-_VALID_AI_PROVIDERS = {"ollama", "openai", "anthropic", "none"}
+_VALID_AI_PROVIDERS = {
+    "ollama",
+    "openai",
+    "anthropic",
+    "openai-compatible",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
+    "localai",
+    "openrouter",
+    "none",
+}
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 
@@ -154,6 +190,43 @@ def _apply_config_dict(config: Config, data: object) -> None:
                     config.ai.anthropic_api_key = ai_data["anthropic_api_key"]
                 else:
                     _warn_invalid_value("ai.anthropic_api_key", ai_data["anthropic_api_key"])
+            if "openai_compatible_api_key" in ai_data:
+                if isinstance(ai_data["openai_compatible_api_key"], str | type(None)):
+                    config.ai.openai_compatible_api_key = ai_data[
+                        "openai_compatible_api_key"
+                    ]
+                else:
+                    _warn_invalid_value(
+                        "ai.openai_compatible_api_key",
+                        ai_data["openai_compatible_api_key"],
+                    )
+            if "openai_compatible_base_url" in ai_data:
+                if isinstance(ai_data["openai_compatible_base_url"], str):
+                    config.ai.openai_compatible_base_url = ai_data[
+                        "openai_compatible_base_url"
+                    ]
+                else:
+                    _warn_invalid_value(
+                        "ai.openai_compatible_base_url",
+                        ai_data["openai_compatible_base_url"],
+                    )
+            for key in (
+                "lmstudio_base_url",
+                "vllm_base_url",
+                "llamacpp_base_url",
+                "localai_base_url",
+                "openrouter_base_url",
+            ):
+                if key in ai_data:
+                    if isinstance(ai_data[key], str):
+                        setattr(config.ai, key, ai_data[key])
+                    else:
+                        _warn_invalid_value(f"ai.{key}", ai_data[key])
+            if "openrouter_api_key" in ai_data:
+                if isinstance(ai_data["openrouter_api_key"], str | type(None)):
+                    config.ai.openrouter_api_key = ai_data["openrouter_api_key"]
+                else:
+                    _warn_invalid_value("ai.openrouter_api_key", ai_data["openrouter_api_key"])
 
     if "server" in data:
         server_data = data["server"]
@@ -201,6 +274,30 @@ def _apply_env_vars(config: Config) -> None:
     if anthropic_key := os.getenv("ANTHROPIC_API_KEY"):
         config.ai.anthropic_api_key = anthropic_key
 
+    if compatible_key := os.getenv("OPENAI_COMPATIBLE_API_KEY"):
+        config.ai.openai_compatible_api_key = compatible_key
+
+    if compatible_url := os.getenv("OPENAI_COMPATIBLE_BASE_URL"):
+        config.ai.openai_compatible_base_url = compatible_url
+
+    if lmstudio_url := os.getenv("LMSTUDIO_BASE_URL"):
+        config.ai.lmstudio_base_url = lmstudio_url
+
+    if vllm_url := os.getenv("VLLM_BASE_URL"):
+        config.ai.vllm_base_url = vllm_url
+
+    if llamacpp_url := os.getenv("LLAMACPP_BASE_URL"):
+        config.ai.llamacpp_base_url = llamacpp_url
+
+    if localai_url := os.getenv("LOCALAI_BASE_URL"):
+        config.ai.localai_base_url = localai_url
+
+    if openrouter_key := os.getenv("OPENROUTER_API_KEY"):
+        config.ai.openrouter_api_key = openrouter_key
+
+    if openrouter_url := os.getenv("OPENROUTER_BASE_URL"):
+        config.ai.openrouter_base_url = openrouter_url
+
     if log_level := os.getenv("GIT_FILTER_REPO_LOG_LEVEL"):
         _apply_log_level(config, log_level, "GIT_FILTER_REPO_LOG_LEVEL")
 
@@ -220,6 +317,14 @@ def create_default_config_file(path: Path | None = None) -> Path:
             "openai_api_key": None,
             "openai_base_url": "https://api.openai.com/v1",
             "anthropic_api_key": None,
+            "openai_compatible_api_key": None,
+            "openai_compatible_base_url": "http://localhost:1234/v1",
+            "lmstudio_base_url": "http://localhost:1234/v1",
+            "vllm_base_url": "http://localhost:8000/v1",
+            "llamacpp_base_url": "http://localhost:8080/v1",
+            "localai_base_url": "http://localhost:8080/v1",
+            "openrouter_api_key": None,
+            "openrouter_base_url": "https://openrouter.ai/api/v1",
         },
         "server": {"log_level": "INFO", "default_dry_run": True, "auto_backup": True},
     }
