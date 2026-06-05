@@ -99,6 +99,20 @@ rewrite flow.
 | `OPENROUTER_API_KEY` | OpenRouter API key | - |
 | `OPENROUTER_BASE_URL` | OpenRouter API base URL | `https://openrouter.ai/api/v1` |
 
+## Configuration Files
+
+Configuration is loaded in this priority order:
+
+1. Environment variables
+2. Local project config: `./config.json`
+3. User config: `~/.config/git-filter-repo-mcp/config.json`
+4. Built-in defaults
+
+Use [config.example.json](config.example.json) as the template for either config
+file location. Local project config is useful when one repository should always
+use a specific local model or endpoint; environment variables are best for MCP
+host configuration such as Claude Desktop.
+
 ## AI Provider Setup
 
 ### Ollama
@@ -163,6 +177,32 @@ The rewrite tools can override config for a single MCP call:
   "dry_run": true
 }
 ```
+
+`check_ai_provider` accepts the same provider override fields plus
+`check_connection`. Set `check_connection: false` to resolve config without
+contacting the model server.
+
+```json
+{
+  "ai_provider": "lmstudio",
+  "ai_model": "local-model",
+  "ai_base_url": "http://localhost:1234/v1",
+  "check_connection": true
+}
+```
+
+## Rewrite Modes
+
+`rewrite_commit_messages` supports exactly one rewrite mode per call:
+
+| Mode | Arguments | Use when |
+|------|-----------|----------|
+| AI generation | `use_ai: true` | You want the configured provider to generate messages |
+| Message mapping | `manual_mappings` | You want to replace every matching old message string |
+| Commit mapping | `manual_commit_mappings` | You want to apply exact reviewed messages by commit hash |
+
+Do not combine these modes in one call. Use `dry_run: true` first for every
+mode, then apply with `dry_run: false` after reviewing the result.
 
 ### Apply an Approved Preview Without AI
 
@@ -246,7 +286,7 @@ Useful providers:
 
 #### AI Rewrite Options
 
-`rewrite_commit_messages` supports:
+`rewrite_commit_messages` supports these AI and mapping options:
 
 | Argument | Description |
 |----------|-------------|
@@ -259,6 +299,7 @@ Useful providers:
 | `ai_check_connection` | Check provider before generation |
 | `ai_max_concurrency` | Concurrent AI requests for batch rewrites |
 | `max_commits` | Limit rewrite generation to the newest N commits |
+| `manual_mappings` | Apply `{old_message: new_message}` mappings without AI |
 | `manual_commit_mappings` | Apply exact `{commit_hash: new_message}` mappings without AI |
 | `style` | `conventional`, `gitmoji`, `simple`, or `detailed` |
 
@@ -281,6 +322,7 @@ Useful providers:
 "Find large files over 25MB"
 "Check the LM Studio AI provider"
 "Rewrite commits to conventional format"
+"Apply the approved commit-message preview without calling AI again"
 "Remove secrets.json from history"
 "Change author old@email.com to new@email.com"
 "Move commits to evening hours"
